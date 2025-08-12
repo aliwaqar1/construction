@@ -1,7 +1,7 @@
 app_name = "construction"
 app_title = "construction"
 app_publisher = "ali waqar"
-app_description = "construction_estimate"
+app_description = "construction_eastimate"
 app_email = "aliwaqar15677@gmail.com"
 app_license = "mit"
 # required_apps = []

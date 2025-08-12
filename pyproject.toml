@@ -3,7 +3,7 @@ name = "construction"
 authors = [
     { name = "ali waqar", email = "aliwaqar15677@gmail.com"}
 ]
-description = "construction_estimate"
+description = "construction_eastimate"
 requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]

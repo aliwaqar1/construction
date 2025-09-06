@@ -5,19 +5,565 @@
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
-  "foundation_3f_qty"
+  "gray_structure_tab",
+  "section_break_zzhq",
+  "foundation_section",
+  "foundation_3f_qty",
+  "foundation_4f_qty",
+  "foundation_rate",
+  "termite_spray_section",
+  "termite_spray_qty",
+  "termite_spray_rate",
+  "rori_section",
+  "rori_qty",
+  "rori_rate",
+  "rait_ravi_section",
+  "rait_ravi_qty",
+  "rait_ravi_rate",
+  "rait_chanab_section",
+  "rait_chanab_qty",
+  "rait_chanab_rate",
+  "section_break_pj0u",
+  "ent_bricks_section",
+  "ent_qty",
+  "ent_awal_plus_rate",
+  "ent_awal_rate",
+  "ent_dom_rate",
+  "cement_section",
+  "cement_qty",
+  "cement_rate",
+  "bajri_section",
+  "bajri_qty",
+  "bajri_rate",
+  "saria_column",
+  "saria_local_rate",
+  "saria_branded_rate",
+  "saria_qty",
+  "pump_bore_column",
+  "pump_bore_rate",
+  "pump_bore_qty",
+  "bijli_pipes_column",
+  "bijli_local_rate",
+  "bijli_branded_rate",
+  "section_break_d8bd",
+  "sanitary_pipes_column",
+  "sanitary_local_rate",
+  "sanitary_branded_rate",
+  "gate_and_steel_chaukhat_column",
+  "gate_16g_rate",
+  "gate_18g_rate",
+  "labour_rate",
+  "other_expenses",
+  "finishing_tab",
+  "section_break_k2qy",
+  "floor_column",
+  "floor_qty",
+  "marble_rate",
+  "tile_rate",
+  "bathroom_tile_column",
+  "bathroom_tile_qty",
+  "bathroom_tile_rate",
+  "flooring_labour_column",
+  "floor_labour_rate",
+  "chat_tile_column",
+  "chat_tile_rate",
+  "chat_tile_qty",
+  "section_break_3sw1",
+  "lightning_switchboard_column",
+  "lightning_switchboard_rate",
+  "electrical_wiring_column",
+  "electrical_wiring_local_rate",
+  "electrical_wiring_branded_rate",
+  "roof_ceiling_column",
+  "roof_ceiling_qty",
+  "roof_ceiling_rate",
+  "wood_martial_column",
+  "wood_martial_ratelocal",
+  "wood_martial_rate",
+  "wood_martial_lab",
+  "paint_column",
+  "paint_with_lab_rate",
+  "simple_paint_with_lab_rate",
+  "section_break_rtwb",
+  "window_column",
+  "aluminium",
+  "steel",
+  "window_qty",
+  "sanitary_fitting_column",
+  "sanitary_fitting_local_rate",
+  "sanitary_fitting_lab_rate",
+  "sanitary_fitting_branded_rate",
+  "steel_stainless_grill_column",
+  "steel_stainless_rate",
+  "steel_stainless_qty",
+  "stair_and_kitchen_marble_column",
+  "stair_and_kitchen_marble_rate"
  ],
  "fields": [
   {
    "fieldname": "foundation_3f_qty",
    "fieldtype": "Float",
    "label": "Foundation 3F qty"
+  },
+  {
+   "fieldname": "foundation_section",
+   "fieldtype": "Column Break",
+   "label": "Foundation"
+  },
+  {
+   "fieldname": "foundation_4f_qty",
+   "fieldtype": "Float",
+   "label": "Foundation 4F qty"
+  },
+  {
+   "fieldname": "foundation_rate",
+   "fieldtype": "Float",
+   "label": "Foundation Rate"
+  },
+  {
+   "fieldname": "termite_spray_section",
+   "fieldtype": "Column Break",
+   "label": "Termite Spray"
+  },
+  {
+   "fieldname": "termite_spray_qty",
+   "fieldtype": "Float",
+   "label": "Termite Spray Qty"
+  },
+  {
+   "fieldname": "termite_spray_rate",
+   "fieldtype": "Float",
+   "label": "Termite Spray Rate"
+  },
+  {
+   "fieldname": "rori_section",
+   "fieldtype": "Column Break",
+   "label": "Rori"
+  },
+  {
+   "fieldname": "rori_qty",
+   "fieldtype": "Float",
+   "label": "Rori Qty"
+  },
+  {
+   "fieldname": "rori_rate",
+   "fieldtype": "Float",
+   "label": "Rori Rate"
+  },
+  {
+   "fieldname": "rait_ravi_section",
+   "fieldtype": "Column Break",
+   "label": "Rait Ravi"
+  },
+  {
+   "fieldname": "rait_ravi_qty",
+   "fieldtype": "Float",
+   "label": "Rait Ravi Qty"
+  },
+  {
+   "fieldname": "rait_ravi_rate",
+   "fieldtype": "Float",
+   "label": "Rait Ravi Rate"
+  },
+  {
+   "fieldname": "rait_chanab_section",
+   "fieldtype": "Column Break",
+   "label": "Rait Chanab"
+  },
+  {
+   "fieldname": "rait_chanab_qty",
+   "fieldtype": "Float",
+   "label": "Rait Chanab Qty"
+  },
+  {
+   "fieldname": "rait_chanab_rate",
+   "fieldtype": "Float",
+   "label": "Rait Chanab Rate"
+  },
+  {
+   "fieldname": "gray_structure_tab",
+   "fieldtype": "Tab Break",
+   "label": "Gray Structure"
+  },
+  {
+   "fieldname": "section_break_zzhq",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "ent_bricks_section",
+   "fieldtype": "Column Break",
+   "label": "Ent (Bricks)"
+  },
+  {
+   "fieldname": "ent_qty",
+   "fieldtype": "Float",
+   "label": "Ent qty"
+  },
+  {
+   "fieldname": "ent_awal_plus_rate",
+   "fieldtype": "Float",
+   "label": "Ent Awal Plus Rate"
+  },
+  {
+   "fieldname": "ent_awal_rate",
+   "fieldtype": "Float",
+   "label": "Ent Awal Rate"
+  },
+  {
+   "fieldname": "ent_dom_rate",
+   "fieldtype": "Float",
+   "label": "Ent Dom Rate"
+  },
+  {
+   "fieldname": "cement_section",
+   "fieldtype": "Column Break",
+   "label": "Cement"
+  },
+  {
+   "fieldname": "cement_qty",
+   "fieldtype": "Float",
+   "label": "Cement Qty"
+  },
+  {
+   "fieldname": "cement_rate",
+   "fieldtype": "Float",
+   "label": "Cement Rate"
+  },
+  {
+   "fieldname": "bajri_section",
+   "fieldtype": "Column Break",
+   "label": "Bajri"
+  },
+  {
+   "fieldname": "bajri_qty",
+   "fieldtype": "Float",
+   "label": "Bajri Qty"
+  },
+  {
+   "fieldname": "bajri_rate",
+   "fieldtype": "Float",
+   "label": "Bajri Rate"
+  },
+  {
+   "fieldname": "section_break_pj0u",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "saria_column",
+   "fieldtype": "Column Break",
+   "label": "Saria"
+  },
+  {
+   "fieldname": "saria_local_rate",
+   "fieldtype": "Int",
+   "label": "Saria Local Rate"
+  },
+  {
+   "fieldname": "saria_branded_rate",
+   "fieldtype": "Int",
+   "label": "Saria Branded Rate"
+  },
+  {
+   "fieldname": "saria_qty",
+   "fieldtype": "Float",
+   "label": "Saria Qty"
+  },
+  {
+   "fieldname": "pump_bore_column",
+   "fieldtype": "Column Break",
+   "label": "Pump Bore "
+  },
+  {
+   "fieldname": "pump_bore_rate",
+   "fieldtype": "Int",
+   "label": "Pump Bore Rate"
+  },
+  {
+   "fieldname": "pump_bore_qty",
+   "fieldtype": "Float",
+   "label": "Pump Bore Qty"
+  },
+  {
+   "fieldname": "bijli_pipes_column",
+   "fieldtype": "Column Break",
+   "label": "Bijli Pipes"
+  },
+  {
+   "fieldname": "bijli_local_rate",
+   "fieldtype": "Int",
+   "label": "Bijli Local Rate"
+  },
+  {
+   "fieldname": "bijli_branded_rate",
+   "fieldtype": "Int",
+   "label": "Bijli Branded Rate"
+  },
+  {
+   "fieldname": "section_break_d8bd",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "sanitary_pipes_column",
+   "fieldtype": "Column Break",
+   "label": "Sanitary Pipes"
+  },
+  {
+   "fieldname": "sanitary_local_rate",
+   "fieldtype": "Int",
+   "label": "Sanitary Local Rate"
+  },
+  {
+   "fieldname": "sanitary_branded_rate",
+   "fieldtype": "Int",
+   "label": "Sanitary Branded Rate"
+  },
+  {
+   "fieldname": "gate_and_steel_chaukhat_column",
+   "fieldtype": "Column Break",
+   "label": "Gate and Steel Chaukhat"
+  },
+  {
+   "fieldname": "gate_16g_rate",
+   "fieldtype": "Int",
+   "label": "gate_16g_rate"
+  },
+  {
+   "fieldname": "gate_18g_rate",
+   "fieldtype": "Int",
+   "label": "gate_18g_rate"
+  },
+  {
+   "fieldname": "labour_rate",
+   "fieldtype": "Int",
+   "label": "Labour Rate "
+  },
+  {
+   "fieldname": "finishing_tab",
+   "fieldtype": "Tab Break",
+   "label": "Finishing"
+  },
+  {
+   "fieldname": "other_expenses",
+   "fieldtype": "Int",
+   "label": "Other Expenses Rate"
+  },
+  {
+   "fieldname": "section_break_k2qy",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "floor_column",
+   "fieldtype": "Column Break",
+   "label": "Floor"
+  },
+  {
+   "fieldname": "floor_qty",
+   "fieldtype": "Float",
+   "label": "Floor qty"
+  },
+  {
+   "fieldname": "marble_rate",
+   "fieldtype": "Int",
+   "label": "Marble Rate"
+  },
+  {
+   "fieldname": "tile_rate",
+   "fieldtype": "Int",
+   "label": "Tile Rate"
+  },
+  {
+   "fieldname": "bathroom_tile_column",
+   "fieldtype": "Column Break",
+   "label": "Bathroom Tile"
+  },
+  {
+   "fieldname": "bathroom_tile_qty",
+   "fieldtype": "Float",
+   "label": "Bathroom Tile Qty"
+  },
+  {
+   "fieldname": "bathroom_tile_rate",
+   "fieldtype": "Int",
+   "label": "Bathroom Tile Rate"
+  },
+  {
+   "fieldname": "flooring_labour_column",
+   "fieldtype": "Column Break",
+   "label": "Flooring labour"
+  },
+  {
+   "fieldname": "floor_labour_rate",
+   "fieldtype": "Int",
+   "label": "Floor Labour Rate"
+  },
+  {
+   "fieldname": "chat_tile_column",
+   "fieldtype": "Column Break",
+   "label": "Chat Tile"
+  },
+  {
+   "fieldname": "chat_tile_rate",
+   "fieldtype": "Int",
+   "label": "Chat Tile Rate"
+  },
+  {
+   "fieldname": "chat_tile_qty",
+   "fieldtype": "Float",
+   "label": "Chat Tile Qty"
+  },
+  {
+   "fieldname": "section_break_3sw1",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "lightning_switchboard_column",
+   "fieldtype": "Column Break",
+   "label": "Lightning Switchboard"
+  },
+  {
+   "fieldname": "lightning_switchboard_rate",
+   "fieldtype": "Int",
+   "label": "Lightning Switchboard rate"
+  },
+  {
+   "fieldname": "electrical_wiring_column",
+   "fieldtype": "Column Break",
+   "label": "Electrical Wiring"
+  },
+  {
+   "fieldname": "electrical_wiring_local_rate",
+   "fieldtype": "Int",
+   "label": "Electrical Wiring local rate"
+  },
+  {
+   "fieldname": "electrical_wiring_branded_rate",
+   "fieldtype": "Int",
+   "label": "Electrical Wiring branded Rate"
+  },
+  {
+   "fieldname": "roof_ceiling_column",
+   "fieldtype": "Column Break",
+   "label": "Roof Ceiling"
+  },
+  {
+   "fieldname": "roof_ceiling_qty",
+   "fieldtype": "Float",
+   "label": "Roof Ceiling Qty"
+  },
+  {
+   "fieldname": "roof_ceiling_rate",
+   "fieldtype": "Int",
+   "label": "Roof Ceiling Rate"
+  },
+  {
+   "fieldname": "wood_martial_column",
+   "fieldtype": "Column Break",
+   "label": "Wood Martial"
+  },
+  {
+   "fieldname": "wood_martial_rate",
+   "fieldtype": "Int",
+   "label": "Wood Martial Rate"
+  },
+  {
+   "fieldname": "wood_martial_lab",
+   "fieldtype": "Int",
+   "label": "Wood Martial Lab"
+  },
+  {
+   "fieldname": "wood_martial_ratelocal",
+   "fieldtype": "Int",
+   "label": "Wood Martial Rate(local)"
+  },
+  {
+   "fieldname": "paint_column",
+   "fieldtype": "Column Break",
+   "label": "Paint"
+  },
+  {
+   "fieldname": "paint_with_lab_rate",
+   "fieldtype": "Int",
+   "label": "Paint with lab Rate"
+  },
+  {
+   "fieldname": "simple_paint_with_lab_rate",
+   "fieldtype": "Int",
+   "label": "simple Paint with lab rate"
+  },
+  {
+   "fieldname": "section_break_rtwb",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "window_column",
+   "fieldtype": "Column Break",
+   "label": "Window "
+  },
+  {
+   "fieldname": "aluminium",
+   "fieldtype": "Int",
+   "label": "Aluminium Rate"
+  },
+  {
+   "fieldname": "steel",
+   "fieldtype": "Int",
+   "label": "Steel Rate"
+  },
+  {
+   "fieldname": "window_qty",
+   "fieldtype": "Float",
+   "label": "Window Qty"
+  },
+  {
+   "fieldname": "sanitary_fitting_column",
+   "fieldtype": "Column Break",
+   "label": "Sanitary Fitting"
+  },
+  {
+   "fieldname": "sanitary_fitting_local_rate",
+   "fieldtype": "Int",
+   "label": "Sanitary Fitting Local Rate"
+  },
+  {
+   "fieldname": "sanitary_fitting_lab_rate",
+   "fieldtype": "Int",
+   "label": "Sanitary Fitting lab rate"
+  },
+  {
+   "fieldname": "sanitary_fitting_branded_rate",
+   "fieldtype": "Int",
+   "label": "Sanitary Fitting branded Rate"
+  },
+  {
+   "fieldname": "steel_stainless_grill_column",
+   "fieldtype": "Column Break",
+   "label": "Steel Stainless Grill"
+  },
+  {
+   "fieldname": "steel_stainless_rate",
+   "fieldtype": "Int",
+   "label": "Steel Stainless Rate"
+  },
+  {
+   "fieldname": "steel_stainless_qty",
+   "fieldtype": "Float",
+   "label": "Steel Stainless Qty"
+  },
+  {
+   "fieldname": "stair_and_kitchen_marble_column",
+   "fieldtype": "Column Break",
+   "label": "Stair and Kitchen Marble"
+  },
+  {
+   "fieldname": "stair_and_kitchen_marble_rate",
+   "fieldtype": "Int",
+   "label": "Stair and Kitchen Marble with lab Rate "
   }
  ],
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2025-08-12 07:56:41.756616",
+ "modified": "2025-08-28 14:20:37.113528",
  "modified_by": "Administrator",
  "module": "construction",
  "name": "Construction Setting",

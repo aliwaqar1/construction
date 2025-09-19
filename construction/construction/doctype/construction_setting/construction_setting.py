@@ -157,7 +157,7 @@ def calculate_finish_estimate(settings, covered_area, flooring_type=None,
 
     # ---------------- Wood Martial ----------------
     if wood_type == "Local":
-        wood_rate = settings.wood_martial_rate_local
+        wood_rate = settings.wood_martial_ratelocal
     else:
         wood_rate = settings.wood_martial_rate
     wood_qty = int(covered_area)

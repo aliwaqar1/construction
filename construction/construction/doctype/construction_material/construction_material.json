@@ -1,0 +1,78 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-10-09 08:17:57.129722",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "city",
+  "material_quality",
+  "area_unit",
+  "column_break_materials",
+  "materials",
+  "last_updated"
+ ],
+ "fields": [
+  {
+   "fieldname": "city",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "City",
+   "reqd": 1
+  },
+  {
+   "fieldname": "material_quality",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Material Quality",
+   "options": "Basic\nMedium\nPremium",
+   "reqd": 1
+  },
+  {
+   "default": "sqft",
+   "fieldname": "area_unit",
+   "fieldtype": "Select",
+   "label": "Area Unit",
+   "options": "sqft\nsqm"
+  },
+  {
+   "fieldname": "column_break_materials",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "materials",
+   "fieldtype": "Table",
+   "label": "Material Rates",
+   "options": "Material Rate"
+  },
+  {
+   "fieldname": "last_updated",
+   "fieldtype": "Datetime",
+   "label": "Last Updated"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2025-10-11 12:30:50.925241",
+ "modified_by": "Administrator",
+ "module": "construction",
+ "name": "Construction Material",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

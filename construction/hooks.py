@@ -130,6 +130,9 @@ app_license = "mit"
 # 	}
 # }
 
+override_whitelisted_methods = {
+    "construction.api.estimate.get_estimate": "construction.api.estimate.get_estimate"
+}
 # Scheduled Tasks
 # ---------------
 

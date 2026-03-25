@@ -1,0 +1,74 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "field:material_type",
+ "creation": "2025-10-09 10:00:00",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "material_type",
+  "uom",
+  "ratio_per_sqft",
+  "section_break_info",
+  "description"
+ ],
+ "fields": [
+  {
+   "fieldname": "material_type",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Material Type",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "uom",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Unit of Measure",
+   "reqd": 1
+  },
+  {
+   "description": "Material required per square foot (e.g. 0.12 bags, 0.08 cft)",
+   "fieldname": "ratio_per_sqft",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Ratio per Sq.Ft",
+   "reqd": 1
+  },
+  {
+   "fieldname": "section_break_info",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "description",
+   "fieldtype": "Small Text",
+   "label": "Description"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2025-10-10 03:32:12.369984",
+ "modified_by": "Administrator",
+ "module": "construction",
+ "name": "Material Master",
+ "naming_rule": "By fieldname",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

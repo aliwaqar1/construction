@@ -1,0 +1,41 @@
+{
+ "doctype": "DocType",
+ "name": "Material Rate",
+ "module": "construction",
+ "istable": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "material",
+  "uom",
+  "rate",
+  "notes"
+ ],
+ "fields": [
+  {
+   "fieldname": "material",
+   "fieldtype": "Link",
+   "label": "Material",
+   "options": "Material Master",
+   "reqd": 1
+  },
+  {
+   "fieldname": "uom",
+   "fieldtype": "Data",
+   "label": "UOM",
+   "read_only": 1
+  },
+  {
+   "fieldname": "rate",
+   "fieldtype": "Currency",
+   "label": "Rate"
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Small Text",
+   "label": "Notes"
+  }
+ ],
+ "permissions": [],
+ "sort_field": "idx",
+ "sort_order": "ASC"
+}

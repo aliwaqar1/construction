@@ -1,0 +1,13 @@
+[
+  {"doctype": "Estimate City", "name": "PK-Lahore", "city_name": "Lahore", "country_code": "PK", "enabled": 1},
+  {"doctype": "Estimate City", "name": "PK-Islamabad", "city_name": "Islamabad", "country_code": "PK", "enabled": 1},
+  {"doctype": "Estimate City", "name": "PK-Karachi", "city_name": "Karachi", "country_code": "PK", "enabled": 1},
+  {"doctype": "Estimate City", "name": "PK-Rawalpindi", "city_name": "Rawalpindi", "country_code": "PK", "enabled": 1},
+  {"doctype": "Estimate City", "name": "PK-Faisalabad", "city_name": "Faisalabad", "country_code": "PK", "enabled": 1},
+  {"doctype": "Estimate City", "name": "PK-Multan", "city_name": "Multan", "country_code": "PK", "enabled": 1},
+  {"doctype": "Estimate City", "name": "IN-Mumbai", "city_name": "Mumbai", "country_code": "IN", "enabled": 1},
+  {"doctype": "Estimate City", "name": "IN-Delhi", "city_name": "Delhi", "country_code": "IN", "enabled": 1},
+  {"doctype": "Estimate City", "name": "IN-Bangalore", "city_name": "Bangalore", "country_code": "IN", "enabled": 1},
+  {"doctype": "Estimate City", "name": "IN-Chennai", "city_name": "Chennai", "country_code": "IN", "enabled": 1},
+  {"doctype": "Estimate City", "name": "IN-Hyderabad", "city_name": "Hyderabad", "country_code": "IN", "enabled": 1}
+]

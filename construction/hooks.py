@@ -133,6 +133,13 @@ app_license = "mit"
 override_whitelisted_methods = {
     "construction.api.estimate.get_estimate": "construction.api.estimate.get_estimate"
 }
+
+# Fixtures – imported on `bench migrate`
+fixtures = [
+    "Estimate Country",
+    "Estimate City",
+    "Estimate Questionnaire",
+]
 # Scheduled Tasks
 # ---------------
 

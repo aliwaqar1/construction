@@ -9,6 +9,7 @@ Frappe URLs (all allow_guest):
 """
 
 import json
+import traceback
 
 import frappe
 
@@ -16,39 +17,66 @@ from construction.estimate_engine.engine import resolve_estimate
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/meta/countries
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _error_response(code, message, http_status=400, details=None):
+    """Return a structured error dict and set the HTTP status code."""
+    frappe.local.response.http_status_code = http_status
+    resp = {
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    }
+    if details:
+        resp["error"]["details"] = details
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/countries
 # ---------------------------------------------------------------------------
 
 @frappe.whitelist(allow_guest=True)
 def countries():
     """Return all enabled estimate countries."""
-    rows = frappe.get_all(
-        "Estimate Country",
-        filters={"enabled": 1},
-        fields=["code", "country_name", "currency"],
-        order_by="country_name asc",
-    )
-    return {"countries": rows}
+    try:
+        rows = frappe.get_all(
+            "Estimate Country",
+            filters={"enabled": 1},
+            fields=["code", "country_name", "currency"],
+            order_by="country_name asc",
+        )
+        return {"countries": rows}
+    except Exception:
+        frappe.log_error(traceback.format_exc(), "v1.countries")
+        return _error_response("SERVER_ERROR", "Failed to load countries", 500)
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/meta/cities?country=PK
+# GET /v1/cities?country=PK
 # ---------------------------------------------------------------------------
 
 @frappe.whitelist(allow_guest=True)
 def cities(country=None):
     """Return enabled cities, optionally filtered by country code."""
-    filters = {"enabled": 1}
-    if country:
-        filters["country_code"] = country
+    try:
+        filters = {"enabled": 1}
+        if country:
+            filters["country_code"] = country
 
-    rows = frappe.get_all(
-        "Estimate City",
-        filters=filters,
-        fields=["city_name", "country_code"],
-        order_by="city_name asc",
-    )
-    return {"cities": rows}
+        rows = frappe.get_all(
+            "Estimate City",
+            filters=filters,
+            fields=["city_name", "country_code"],
+            order_by="city_name asc",
+        )
+        return {"cities": rows}
+    except Exception:
+        frappe.log_error(traceback.format_exc(), "v1.cities")
+        return _error_response("SERVER_ERROR", "Failed to load cities", 500)
 
 
 # ---------------------------------------------------------------------------
@@ -57,37 +85,42 @@ def cities(country=None):
 
 @frappe.whitelist(allow_guest=True)
 def questionnaire(country=None, city=None, flow=None):
-    """
-    Return the questionnaire definition (ordered steps with questions,
-    options, recommended flags, and conditional visibility).
-    """
+    """Return the questionnaire definition for a country + flow."""
     if not country or not flow:
-        frappe.throw("'country' and 'flow' are required query parameters")
-
-    docs = frappe.get_all(
-        "Estimate Questionnaire",
-        filters={"country": country, "flow_key": flow},
-        fields=["flow_key", "country", "version", "title", "description", "steps_json"],
-        limit=1,
-    )
-
-    if not docs:
-        frappe.throw(
-            f"No questionnaire found for country={country}, flow={flow}",
-            exc=frappe.DoesNotExistError,
+        return _error_response(
+            "MISSING_PARAMS",
+            "'country' and 'flow' are required query parameters",
         )
 
-    doc = docs[0]
-    steps_data = json.loads(doc.steps_json) if doc.steps_json else {"steps": []}
+    try:
+        docs = frappe.get_all(
+            "Estimate Questionnaire",
+            filters={"country": country, "flow_key": flow},
+            fields=["flow_key", "country", "version", "title", "description", "steps_json"],
+            limit=1,
+        )
 
-    return {
-        "flow_key": doc.flow_key,
-        "country": doc.country,
-        "version": doc.version,
-        "title": doc.title,
-        "description": doc.description,
-        "steps": steps_data.get("steps", []),
-    }
+        if not docs:
+            return _error_response(
+                "NOT_FOUND",
+                f"No questionnaire found for country={country}, flow={flow}",
+                404,
+            )
+
+        doc = docs[0]
+        steps_data = json.loads(doc.steps_json) if doc.steps_json else {"steps": []}
+
+        return {
+            "flow_key": doc.flow_key,
+            "country": doc.country,
+            "version": doc.version,
+            "title": doc.title,
+            "description": doc.description,
+            "steps": steps_data.get("steps", []),
+        }
+    except Exception:
+        frappe.log_error(traceback.format_exc(), "v1.questionnaire")
+        return _error_response("SERVER_ERROR", "Failed to load questionnaire", 500)
 
 
 # ---------------------------------------------------------------------------
@@ -96,36 +129,23 @@ def questionnaire(country=None, city=None, flow=None):
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def estimate(**kwargs):
-    """
-    Compute a construction estimate.
-
-    Expects JSON body::
-
-        {
-            "country": "PK",
-            "city": "Lahore",
-            "plot_size_sqft": 1125,
-            "covered_area_sqft": 1125,
-            "answers": {
-                "structure_type": "gray",
-                "drawing_required": "no",
-                "brick_type": "awal",
-                ...
-            }
-        }
-
-    Returns::
-
-        {
-            "line_items": [{material, material_key, phase, qty, unit, rate, cost}, ...],
-            "totals": {"gray": ..., "finish": ..., "overall": ...},
-            "phase_breakdown": { ... }   // optional, present when finish is included
-        }
-    """
-    # Accept both form-encoded params and JSON body
+    """Compute a construction estimate."""
+    # ── Parse request body ──
     data = kwargs
     if frappe.request and frappe.request.is_json:
-        data = frappe.parse_json(frappe.request.data)
+        raw_data = frappe.request.data
+        if isinstance(raw_data, bytes):
+            raw_data = raw_data.decode("utf-8")
+
+        try:
+            parsed_data = frappe.parse_json(raw_data)
+        except Exception:
+            return _error_response("INVALID_JSON", "Request body is not valid JSON")
+
+        if isinstance(parsed_data, dict):
+            data = parsed_data
+        else:
+            return _error_response("INVALID_JSON", "Request body must be a JSON object")
 
     country = data.get("country")
     city = data.get("city")
@@ -133,28 +153,58 @@ def estimate(**kwargs):
     covered_area = data.get("covered_area_sqft")
     answers = data.get("answers") or {}
 
-    # --- validation ---
+    if isinstance(answers, str):
+        try:
+            answers = frappe.parse_json(answers)
+        except Exception:
+            return _error_response("INVALID_PARAMS", "'answers' is not valid JSON")
+
+    # ── Validation ──
+    missing = []
     if not country:
-        frappe.throw("'country' is required")
+        missing.append("country")
     if not city:
-        frappe.throw("'city' is required")
+        missing.append("city")
     if plot_size is None:
-        frappe.throw("'plot_size_sqft' is required")
+        missing.append("plot_size_sqft")
     if covered_area is None:
-        frappe.throw("'covered_area_sqft' is required")
+        missing.append("covered_area_sqft")
+
+    if missing:
+        return _error_response(
+            "MISSING_PARAMS",
+            f"Missing required fields: {', '.join(missing)}",
+            details={"fields": missing},
+        )
 
     try:
         plot_size = float(plot_size)
         covered_area = float(covered_area)
     except (TypeError, ValueError):
-        frappe.throw("'plot_size_sqft' and 'covered_area_sqft' must be numeric")
+        return _error_response(
+            "INVALID_PARAMS",
+            "'plot_size_sqft' and 'covered_area_sqft' must be numeric",
+        )
 
     if plot_size <= 0 or covered_area <= 0:
-        frappe.throw("'plot_size_sqft' and 'covered_area_sqft' must be positive")
+        return _error_response(
+            "INVALID_PARAMS",
+            "'plot_size_sqft' and 'covered_area_sqft' must be positive",
+        )
 
     if not isinstance(answers, dict):
-        frappe.throw("'answers' must be a JSON object / dict")
+        return _error_response("INVALID_PARAMS", "'answers' must be a JSON object")
 
-    # --- compute ---
-    result = resolve_estimate(country, city, plot_size, covered_area, answers)
-    return result
+    # ── Compute ──
+    try:
+        result = resolve_estimate(country, city, plot_size, covered_area, answers)
+        return result
+    except frappe.ValidationError as e:
+        return _error_response("VALIDATION_ERROR", str(e), 422)
+    except Exception:
+        frappe.log_error(traceback.format_exc(), "v1.estimate")
+        return _error_response(
+            "SERVER_ERROR",
+            "An unexpected error occurred while computing the estimate",
+            500,
+        )

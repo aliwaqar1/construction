@@ -74,6 +74,7 @@ def compute(city, plot_size_sqft, covered_area_sqft, params):
             "unit": m["uom"] or "",
             "rate": float(m["rate"] or 0),
             "cost": round(cost, 2),
+            "display": True,
         })
         total += cost
 

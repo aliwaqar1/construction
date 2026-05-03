@@ -44,6 +44,13 @@ def _slab(value, slabs, default):
     return default
 
 
+_NO_DISPLAY_KEYS = frozenset({
+    "foundation", "drawing", "kaasoo", "pump_bore", "bijli",
+    "sanitary_pipes", "other_expenses", "switchboard", "wiring",
+    "wood_martial", "window", "sanitary_fitting", "steel_grill",
+})
+
+
 def _item(material, key, qty, unit, rate, cost, phase="gray"):
     return {
         "material": material,
@@ -53,6 +60,7 @@ def _item(material, key, qty, unit, rate, cost, phase="gray"):
         "unit": unit,
         "rate": round(float(rate), 2),
         "cost": round(float(cost), 2),
+        "display": key not in _NO_DISPLAY_KEYS,
     }
 
 
@@ -156,9 +164,9 @@ def _calc_gray(settings, ps, ca, foundation_type, drawing_required,
         dc = _slab(ca, DRAWING_SLABS, DRAWING_DEFAULT)
         items.append(_item("Drawing", "drawing", 1, "Lot", dc, dc))
 
-    # 3. Termite Spray (conditional)
+    # 3. Termite Spray (conditional) — uses covered_area
     if termite_spray_required:
-        t_qty = int(ps * (settings.termite_spray_qty or 0))
+        t_qty = int(ca * (settings.termite_spray_qty or 0))
         t_rate = settings.termite_spray_rate or 0
         items.append(_item("Termite Spray", "termite", t_qty, "SF", t_rate, t_qty * t_rate))
 
@@ -261,13 +269,14 @@ def _calc_finish(settings, ca, flooring_type, wiring_type, window_type,
     floor_qty = int(ca * (settings.floor_qty or 0))
     if flooring_type == "Marble":
         fl_rate = settings.marble_rate or 0
-        fl_cost = floor_qty * fl_rate
-        items.append(_item("Floor (Marble)", "floor", floor_qty, "m", fl_rate, fl_cost, "finish"))
+        fl_qty_m = round(floor_qty * 0.092903, 2)  # sqft → sqm
+        fl_cost = fl_qty_m * fl_rate
+        items.append(_item("Floor (Marble)", "floor", fl_qty_m, "m", fl_rate, fl_cost, "finish"))
     else:
-        rate = (settings.tile_rate or 0) * 10.7639
-        qty = floor_qty * 0.092903
-        fl_cost = qty * rate
-        items.append(_item("Floor (Tile)", "floor", round(qty, 2), "m", int(rate), fl_cost, "finish"))
+        fl_rate = settings.tile_rate or 0
+        fl_qty_m = round(floor_qty * 0.092903, 2)  # sqft → sqm
+        fl_cost = fl_qty_m * fl_rate
+        items.append(_item("Floor (Tile)", "floor", fl_qty_m, "m", fl_rate, fl_cost, "finish"))
 
     # 2. Flooring Labour
     fl_lab_rate = settings.floor_labour_rate or 0

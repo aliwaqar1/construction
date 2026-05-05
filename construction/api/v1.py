@@ -8,6 +8,7 @@ Frappe URLs (all allow_guest):
     POST /api/method/construction.api.v1.estimate   {country, city, plot_size_sqft, covered_area_sqft, answers:{…}}
 """
 
+import hashlib
 import json
 import traceback
 
@@ -208,3 +209,61 @@ def estimate(**kwargs):
             "An unexpected error occurred while computing the estimate",
             500,
         )
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/config?app_version=1.0.0&device_id=...
+# ---------------------------------------------------------------------------
+
+
+def _flag_active_for_device(flag, device_id, app_version):
+    """Decide whether a flag is on for a given device."""
+    if not flag.get("enabled"):
+        return False
+
+    min_v = (flag.get("min_app_version") or "").strip()
+    if min_v and app_version:
+        try:
+            cur = tuple(int(p) for p in app_version.split("."))
+            req = tuple(int(p) for p in min_v.split("."))
+            if cur < req:
+                return False
+        except ValueError:
+            pass
+
+    rollout = flag.get("rollout_percentage")
+    if rollout is None:
+        rollout = 100
+    rollout = max(0, min(100, int(rollout)))
+    if rollout >= 100:
+        return True
+    if rollout <= 0:
+        return False
+
+    if not device_id:
+        return False
+    bucket = int(hashlib.md5(f"{flag['flag_key']}:{device_id}".encode()).hexdigest(), 16) % 100
+    return bucket < rollout
+
+
+@frappe.whitelist(allow_guest=True)
+def config(app_version=None, device_id=None):
+    """Return feature flags + kill switches for the client.
+
+    Clients should call this on app start (and periodically thereafter)
+    and cache the result. Flags are evaluated server-side per device.
+    """
+    try:
+        rows = frappe.get_all(
+            "Feature Flag",
+            fields=["flag_key", "enabled", "min_app_version", "rollout_percentage"],
+            order_by="flag_key asc",
+        )
+        flags = {r["flag_key"]: _flag_active_for_device(r, device_id, app_version) for r in rows}
+        return {
+            "flags": flags,
+            "min_supported_version": "1.0.0",
+        }
+    except Exception:
+        frappe.log_error(traceback.format_exc(), "v1.config")
+        return _error_response("SERVER_ERROR", "Failed to load config", 500)

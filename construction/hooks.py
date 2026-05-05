@@ -139,6 +139,7 @@ fixtures = [
     "Estimate Country",
     "Estimate City",
     "Estimate Questionnaire",
+    "Feature Flag",
 ]
 # Scheduled Tasks
 # ---------------

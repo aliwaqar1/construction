@@ -1,6 +1,7 @@
 [
  {
   "doctype": "Feature Flag",
+  "name": "banner_ads",
   "flag_key": "banner_ads",
   "enabled": 1,
   "description": "Show AdMob banner ads in the Flutter app",
@@ -8,6 +9,7 @@
  },
  {
   "doctype": "Feature Flag",
+  "name": "analytics",
   "flag_key": "analytics",
   "enabled": 1,
   "description": "Fire-and-forget analytics events from the client",
@@ -15,6 +17,7 @@
  },
  {
   "doctype": "Feature Flag",
+  "name": "server_save",
   "flag_key": "server_save",
   "enabled": 0,
   "description": "Phase 2 — save estimates to backend (requires auth)",
@@ -22,6 +25,7 @@
  },
  {
   "doctype": "Feature Flag",
+  "name": "ai_floor_plan",
   "flag_key": "ai_floor_plan",
   "enabled": 0,
   "description": "Phase 2 — AI floor plan analysis (kill switch)",
@@ -29,6 +33,7 @@
  },
  {
   "doctype": "Feature Flag",
+  "name": "ai_interior_design",
   "flag_key": "ai_interior_design",
   "enabled": 0,
   "description": "Phase 2 — AI interior design (kill switch)",

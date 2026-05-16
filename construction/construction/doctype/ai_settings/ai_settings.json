@@ -1,0 +1,212 @@
+{
+  "actions": [],
+  "creation": "2026-05-06 00:00:00.000000",
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "issingle": 1,
+  "field_order": [
+    "global_section",
+    "enabled",
+    "alert_email",
+    "alert_threshold_percent",
+    "global_daily_budget_cents",
+    "global_monthly_budget_cents",
+    "kill_switch_until",
+    "vendor_keys_section",
+    "gemini_api_key",
+    "fal_api_key",
+    "anthropic_api_key",
+    "openai_api_key",
+    "floor_plan_section",
+    "floor_plan_vendor",
+    "floor_plan_model",
+    "floor_plan_max_cost_cents",
+    "floor_plan_daily_budget_cents",
+    "floor_plan_monthly_budget_cents",
+    "floor_plan_rate_limit_per_min",
+    "interior_section",
+    "interior_vendor",
+    "interior_model",
+    "interior_max_cost_cents",
+    "interior_daily_budget_cents",
+    "interior_monthly_budget_cents",
+    "interior_rate_limit_per_min"
+  ],
+  "fields": [
+    {
+      "fieldname": "global_section",
+      "fieldtype": "Section Break",
+      "label": "Global"
+    },
+    {
+      "fieldname": "enabled",
+      "fieldtype": "Check",
+      "default": "1",
+      "label": "AI Enabled (master switch)",
+      "description": "If unchecked, all AI submits return AI_DISABLED."
+    },
+    {
+      "fieldname": "alert_email",
+      "fieldtype": "Data",
+      "label": "Budget alert email",
+      "description": "Notified when usage crosses alert_threshold_percent of any budget."
+    },
+    {
+      "fieldname": "alert_threshold_percent",
+      "fieldtype": "Int",
+      "default": "80",
+      "label": "Alert threshold %"
+    },
+    {
+      "fieldname": "global_daily_budget_cents",
+      "fieldtype": "Int",
+      "default": "500",
+      "label": "Global daily budget (cents)",
+      "description": "Combined cap across all AI job types per day. 0 = unlimited."
+    },
+    {
+      "fieldname": "global_monthly_budget_cents",
+      "fieldtype": "Int",
+      "default": "10000",
+      "label": "Global monthly budget (cents)",
+      "description": "Combined cap across all AI job types per month. 0 = unlimited."
+    },
+    {
+      "fieldname": "kill_switch_until",
+      "fieldtype": "Datetime",
+      "label": "Kill switch until",
+      "read_only": 1,
+      "description": "Set automatically when a budget cap is hit. AI is disabled until this time. Clear manually to re-enable early."
+    },
+    {
+      "fieldname": "vendor_keys_section",
+      "fieldtype": "Section Break",
+      "label": "Vendor keys"
+    },
+    {
+      "fieldname": "gemini_api_key",
+      "fieldtype": "Password",
+      "label": "Google Gemini API key"
+    },
+    {
+      "fieldname": "fal_api_key",
+      "fieldtype": "Password",
+      "label": "fal.ai API key"
+    },
+    {
+      "fieldname": "anthropic_api_key",
+      "fieldtype": "Password",
+      "label": "Anthropic API key"
+    },
+    {
+      "fieldname": "openai_api_key",
+      "fieldtype": "Password",
+      "label": "OpenAI API key"
+    },
+    {
+      "fieldname": "floor_plan_section",
+      "fieldtype": "Section Break",
+      "label": "Floor plan"
+    },
+    {
+      "fieldname": "floor_plan_vendor",
+      "fieldtype": "Select",
+      "options": "gemini\nopenai\nanthropic",
+      "default": "gemini",
+      "label": "Vendor"
+    },
+    {
+      "fieldname": "floor_plan_model",
+      "fieldtype": "Data",
+      "default": "gemini-2.0-flash",
+      "label": "Model"
+    },
+    {
+      "fieldname": "floor_plan_max_cost_cents",
+      "fieldtype": "Int",
+      "default": "5",
+      "label": "Max cost per request (cents)",
+      "description": "Hard cap per single job. If estimated cost exceeds this, request is rejected pre-call."
+    },
+    {
+      "fieldname": "floor_plan_daily_budget_cents",
+      "fieldtype": "Int",
+      "default": "200",
+      "label": "Daily budget (cents)"
+    },
+    {
+      "fieldname": "floor_plan_monthly_budget_cents",
+      "fieldtype": "Int",
+      "default": "5000",
+      "label": "Monthly budget (cents)"
+    },
+    {
+      "fieldname": "floor_plan_rate_limit_per_min",
+      "fieldtype": "Int",
+      "default": "5",
+      "label": "Rate limit (requests/min/user)"
+    },
+    {
+      "fieldname": "interior_section",
+      "fieldtype": "Section Break",
+      "label": "Interior design"
+    },
+    {
+      "fieldname": "interior_vendor",
+      "fieldtype": "Select",
+      "options": "fal\nreplicate\ntogether",
+      "default": "fal",
+      "label": "Vendor"
+    },
+    {
+      "fieldname": "interior_model",
+      "fieldtype": "Data",
+      "default": "fal-ai/flux/schnell",
+      "label": "Model"
+    },
+    {
+      "fieldname": "interior_max_cost_cents",
+      "fieldtype": "Int",
+      "default": "10",
+      "label": "Max cost per request (cents)"
+    },
+    {
+      "fieldname": "interior_daily_budget_cents",
+      "fieldtype": "Int",
+      "default": "300",
+      "label": "Daily budget (cents)"
+    },
+    {
+      "fieldname": "interior_monthly_budget_cents",
+      "fieldtype": "Int",
+      "default": "5000",
+      "label": "Monthly budget (cents)"
+    },
+    {
+      "fieldname": "interior_rate_limit_per_min",
+      "fieldtype": "Int",
+      "default": "5",
+      "label": "Rate limit (requests/min/user)"
+    }
+  ],
+  "modified": "2026-05-06 00:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "construction",
+  "name": "AI Settings",
+  "owner": "Administrator",
+  "permissions": [
+    {
+      "create": 1,
+      "delete": 0,
+      "export": 1,
+      "read": 1,
+      "report": 1,
+      "role": "System Manager",
+      "share": 0,
+      "write": 1
+    }
+  ],
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "track_changes": 1
+}

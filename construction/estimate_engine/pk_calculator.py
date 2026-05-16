@@ -3,6 +3,10 @@ Pakistan house-estimate calculator.
 
 Preserves the exact calculation logic from the original
 ``Construction Setting`` endpoint, refactored into a line-items format.
+
+Floor-aware items (foundation, termite spray, sub-base materials) use the
+ground-floor area when ``floor_areas`` is provided so multi-storey
+estimates do not double-count single-pour work.
 """
 
 import frappe
@@ -68,20 +72,29 @@ def _item(material, key, qty, unit, rate, cost, phase="gray"):
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def compute(city, plot_size_sqft, covered_area_sqft, params):
+def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None):
     """
     Compute a Pakistan house estimate.
 
     Parameters
     ----------
-    city : str              – (currently unused – rates come from Construction Setting)
+    city : str              -- (currently unused; rates come from Construction Setting)
     plot_size_sqft : float
-    covered_area_sqft : float
-    params : dict           – merged parameter map from questionnaire impacts
+    covered_area_sqft : float -- sum of per-floor covered areas
+    params : dict           -- merged parameter map from questionnaire impacts
+    floor_areas : list[float] | None
+                            -- per-floor covered areas in sq ft (index 0 = ground).
+                               When omitted, treated as a single floor of
+                               ``covered_area_sqft``.
     """
     settings = frappe.get_single("Construction Setting")
     ps = plot_size_sqft
     ca = covered_area_sqft
+    # Ground-floor area drives single-pour items (foundation, sub-base).
+    if floor_areas:
+        ground = float(floor_areas[0])
+    else:
+        ground = ca
 
     # ---- extract params with safe defaults ----
     construction_type = params.get("construction_type", "gray")
@@ -108,6 +121,7 @@ def compute(city, plot_size_sqft, covered_area_sqft, params):
         settings, ps, ca, foundation_type, drawing_required,
         termite_spray_required, ent_type, saria_type,
         pump_bore_required, pipe_type, sanitary_type, gauge,
+        ground=ground,
     )
 
     # ---- finish line items ----
@@ -146,10 +160,16 @@ def compute(city, plot_size_sqft, covered_area_sqft, params):
 
 def _calc_gray(settings, ps, ca, foundation_type, drawing_required,
                termite_spray_required, ent_type, saria_type,
-               pump_bore_required, pipe_type, sanitary_type, gauge):
+               pump_bore_required, pipe_type, sanitary_type, gauge,
+               ground=None):
+    """``ground`` is the ground-floor covered area for single-pour items;
+    falls back to total ``ca`` so existing single-floor callers keep their
+    semantics."""
+    if ground is None:
+        ground = ca
     items = []
 
-    # 1. Foundation
+    # 1. Foundation -- single pour, scales with plot size only
     f_rate = settings.foundation_rate or 0
     if foundation_type == "3 ft":
         f_qty = int((settings.foundation_3f_qty or 0) * ps)
@@ -159,29 +179,29 @@ def _calc_gray(settings, ps, ca, foundation_type, drawing_required,
         f_qty = 0
     items.append(_item("Foundation", "foundation", f_qty, "SF", f_rate, f_qty * f_rate))
 
-    # 2. Drawing (conditional, slab-based on covered_area)
+    # 2. Drawing (conditional, slab-based on total covered area)
     if drawing_required:
         dc = _slab(ca, DRAWING_SLABS, DRAWING_DEFAULT)
         items.append(_item("Drawing", "drawing", 1, "Lot", dc, dc))
 
-    # 3. Termite Spray (conditional) — uses covered_area
+    # 3. Termite Spray (conditional) -- ground level only
     if termite_spray_required:
-        t_qty = int(ca * (settings.termite_spray_qty or 0))
+        t_qty = int(ground * (settings.termite_spray_qty or 0))
         t_rate = settings.termite_spray_rate or 0
         items.append(_item("Termite Spray", "termite", t_qty, "SF", t_rate, t_qty * t_rate))
 
-    # 4. Rori
-    rori_qty = int(ca * (settings.rori_qty or 0))
+    # 4. Rori -- sub-base, ground only
+    rori_qty = int(ground * (settings.rori_qty or 0))
     rori_rate = settings.rori_rate or 0
     items.append(_item("Rori", "rori", rori_qty, "SF", rori_rate, rori_qty * rori_rate))
 
-    # 5. Rait Ravi
-    rr_qty = int(ca * (settings.rait_ravi_qty or 0))
+    # 5. Rait Ravi -- sub-base, ground only
+    rr_qty = int(ground * (settings.rait_ravi_qty or 0))
     rr_rate = settings.rait_ravi_rate or 0
     items.append(_item("Rait Ravi", "rait_ravi", rr_qty, "SF", rr_rate, rr_qty * rr_rate))
 
-    # 6. Rait Chanab
-    rc_qty = int(ca * (settings.rait_chanab_qty or 0))
+    # 6. Rait Chanab -- sub-base, ground only
+    rc_qty = int(ground * (settings.rait_chanab_qty or 0))
     rc_rate = settings.rait_chanab_rate or 0
     items.append(_item("Rait Chanab", "rait_chanab", rc_qty, "SF", rc_rate, rc_qty * rc_rate))
 
@@ -249,7 +269,7 @@ def _calc_gray(settings, ps, ca, foundation_type, drawing_required,
     l_rate = settings.labour_rate or 0
     items.append(_item("Labour", "labour", l_qty, "SF", l_rate, l_qty * l_rate))
 
-    # 17. Other Expenses (slab on covered_area × 1.5)
+    # 17. Other Expenses (slab on covered_area * 1.5)
     other_base = _slab(ca, OTHER_SLABS, OTHER_DEFAULT)
     other_cost = int(other_base * 1.5)
     items.append(_item("Other Expenses", "other_expenses", 1, "Lot", other_cost, other_cost))
@@ -269,12 +289,12 @@ def _calc_finish(settings, ca, flooring_type, wiring_type, window_type,
     floor_qty = int(ca * (settings.floor_qty or 0))
     if flooring_type == "Marble":
         fl_rate = settings.marble_rate or 0
-        fl_qty_m = round(floor_qty * 0.092903, 2)  # sqft → sqm
+        fl_qty_m = round(floor_qty * 0.092903, 2)  # sqft -> sqm
         fl_cost = fl_qty_m * fl_rate
         items.append(_item("Floor (Marble)", "floor", fl_qty_m, "m", fl_rate, fl_cost, "finish"))
     else:
         fl_rate = settings.tile_rate or 0
-        fl_qty_m = round(floor_qty * 0.092903, 2)  # sqft → sqm
+        fl_qty_m = round(floor_qty * 0.092903, 2)  # sqft -> sqm
         fl_cost = fl_qty_m * fl_rate
         items.append(_item("Floor (Tile)", "floor", fl_qty_m, "m", fl_rate, fl_cost, "finish"))
 

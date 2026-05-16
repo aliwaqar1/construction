@@ -1,0 +1,127 @@
+{
+  "actions": [],
+  "allow_rename": 0,
+  "autoname": "hash",
+  "creation": "2026-05-05 00:00:00.000000",
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "field_order": [
+    "client_id",
+    "user",
+    "country",
+    "city",
+    "plot_size_sqft",
+    "covered_area_sqft",
+    "quality_level",
+    "grand_total",
+    "currency",
+    "answers_json",
+    "snapshot_json",
+    "saved_at"
+  ],
+  "fields": [
+    {
+      "fieldname": "client_id",
+      "fieldtype": "Data",
+      "label": "Client ID",
+      "unique": 1,
+      "description": "UUID generated on the device — used for idempotent sync"
+    },
+    {
+      "fieldname": "user",
+      "fieldtype": "Link",
+      "options": "User",
+      "in_list_view": 1,
+      "in_standard_filter": 1,
+      "label": "User",
+      "reqd": 1
+    },
+    {
+      "fieldname": "country",
+      "fieldtype": "Data",
+      "in_list_view": 1,
+      "label": "Country"
+    },
+    {
+      "fieldname": "city",
+      "fieldtype": "Data",
+      "in_list_view": 1,
+      "label": "City"
+    },
+    {
+      "fieldname": "plot_size_sqft",
+      "fieldtype": "Float",
+      "label": "Plot Size (sqft)"
+    },
+    {
+      "fieldname": "covered_area_sqft",
+      "fieldtype": "Float",
+      "label": "Covered Area (sqft)"
+    },
+    {
+      "fieldname": "quality_level",
+      "fieldtype": "Data",
+      "label": "Quality"
+    },
+    {
+      "fieldname": "grand_total",
+      "fieldtype": "Currency",
+      "in_list_view": 1,
+      "label": "Grand Total"
+    },
+    {
+      "fieldname": "currency",
+      "fieldtype": "Data",
+      "label": "Currency"
+    },
+    {
+      "fieldname": "answers_json",
+      "fieldtype": "Long Text",
+      "label": "Answers JSON"
+    },
+    {
+      "fieldname": "snapshot_json",
+      "fieldtype": "Long Text",
+      "label": "Result Snapshot JSON",
+      "description": "Full computed result at save time — used for compare"
+    },
+    {
+      "fieldname": "saved_at",
+      "fieldtype": "Datetime",
+      "in_list_view": 1,
+      "label": "Saved At"
+    }
+  ],
+  "index_web_pages_for_search": 0,
+  "links": [],
+  "modified": "2026-05-05 00:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "construction",
+  "name": "Estimate History",
+  "owner": "Administrator",
+  "permissions": [
+    {
+      "create": 1,
+      "delete": 1,
+      "email": 0,
+      "export": 1,
+      "print": 0,
+      "read": 1,
+      "report": 1,
+      "role": "System Manager",
+      "share": 0,
+      "write": 1
+    },
+    {
+      "create": 1,
+      "delete": 1,
+      "if_owner": 1,
+      "read": 1,
+      "role": "Website User",
+      "write": 1
+    }
+  ],
+  "sort_field": "saved_at",
+  "sort_order": "DESC",
+  "track_changes": 0
+}

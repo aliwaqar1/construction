@@ -11,7 +11,7 @@ If no questionnaire answers are provided, defaults are used
 import frappe
 
 
-def compute(city, plot_size_sqft, covered_area_sqft, params):
+def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None):
     """
     Compute an India house estimate.
 

@@ -37,11 +37,16 @@ def resolve_estimate(country, city, plot_size_sqft, covered_area_sqft, answers):
     country : str          – ISO-2 code, e.g. "PK", "IN"
     city : str             – city name, e.g. "Lahore"
     plot_size_sqft : float
-    covered_area_sqft : float
-    answers : dict         – flat map of question_key → selected option value
+    covered_area_sqft : float – total covered area; sum of per-floor areas
+                                when provided.
+    answers : dict         – flat map of question_key → selected option value.
+                             May contain `floor_areas` (list[number]) and
+                             `num_floors` (int) for per-floor estimating.
     """
     plot_size_sqft = float(plot_size_sqft)
     covered_area_sqft = float(covered_area_sqft)
+
+    floor_areas = _extract_floor_areas(answers, covered_area_sqft)
 
     # 1. Load questionnaire
     q_doc = frappe.get_all(
@@ -61,7 +66,30 @@ def resolve_estimate(country, city, plot_size_sqft, covered_area_sqft, answers):
     if not calculator:
         frappe.throw(f"No calculator registered for country '{country}'")
 
-    return calculator(city, plot_size_sqft, covered_area_sqft, params)
+    return calculator(
+        city, plot_size_sqft, covered_area_sqft, params, floor_areas=floor_areas
+    )
+
+
+def _extract_floor_areas(answers, covered_area_sqft):
+    """Pull `floor_areas` out of answers, falling back to a single floor.
+
+    Returns a list of positive floats. Always returns at least one entry so
+    calculators can index `[0]` safely.
+    """
+    raw = (answers or {}).get("floor_areas")
+    if isinstance(raw, list) and raw:
+        floors = []
+        for v in raw:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                floors.append(f)
+        if floors:
+            return floors
+    return [covered_area_sqft]
 
 
 # ---------------------------------------------------------------------------

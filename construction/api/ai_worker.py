@@ -1,21 +1,29 @@
-# AI worker — runs as a Frappe RQ background job.
+# AI worker - runs as a Frappe RQ background job.
 #
-# Vendor dispatch is configured in the AI Settings doctype (per job_type).
-#   floor_plan      -> default: gemini  (gemini-2.0-flash, vision)
-#   interior_design -> default: fal.ai  (fal-ai/flux/schnell, txt2img)
+# Vendor dispatch is configured in AI Settings (per tool_id child row):
+#   floor_plan -> default: gemini (gemini-2.0-flash, vision JSON)
+#   interior/exterior/garden/layout/cleanup/ref/paint/replace/floor
+#              -> default: mock (returns a deterministic stock image).
+#                 Flip the row's vendor to "gemini" + model
+#                 "gemini-2.5-flash-image" once a Gemini key is set on
+#                 AI Settings.
 #
 # Each vendor adapter MUST set:
 #   doc.model, doc.tokens_input, doc.tokens_output, doc.cost_cents
-# before returning. cost_cents drives budget enforcement in v1._check_budgets.
+# and store the result_json with shape:
+#   floor_plan: {"ai_result": {...}, "estimate": null}
+#   image-edit: {"images": [{"url", "thumb_url", "seed"}, ...], "prompt"}
+# cost_cents drives budget enforcement in v1._check_budgets.
 
 import base64
+import io
 import json
 import time
 import traceback
 
 import frappe
 import requests
-from frappe.utils import get_files_path, now_datetime
+from frappe.utils import now_datetime
 
 from construction.construction.doctype.ai_settings import ai_settings as ai_cfg
 
@@ -35,12 +43,14 @@ def run_job(name):
 
     try:
         payload = json.loads(doc.request_payload_json or "{}")
-        if doc.job_type == "floor_plan":
+        tool_id = doc.job_type
+
+        if tool_id == "floor_plan":
             result = _run_floor_plan(doc, payload)
-        elif doc.job_type == "interior_design":
-            result = _run_interior_design(doc, payload)
+        elif tool_id in _IMAGE_EDIT_TOOLS:
+            result = _run_image_edit(doc, payload, tool_id)
         else:
-            raise ValueError(f"Unknown job_type: {doc.job_type}")
+            raise ValueError(f"Unknown job_type: {tool_id}")
 
         doc.result_json = json.dumps(result)
         doc.status = "succeeded"
@@ -55,7 +65,7 @@ def run_job(name):
     except Exception:
         frappe.log_error(traceback.format_exc(), f"ai_worker.run:{name}")
         doc.error_code = "WORKER_ERROR"
-        doc.error_message = "Worker failed — see error log"
+        doc.error_message = "Worker failed - see error log"
         doc.status = "failed"
 
     doc.completed_at = now_datetime()
@@ -73,73 +83,89 @@ class _VendorError(Exception):
         self.code = code
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+_IMAGE_EDIT_TOOLS = {
+    "interior", "exterior", "garden", "layout",
+    "cleanup", "ref", "paint", "replace", "floor",
+}
+
+
+# ---------------------------------------------------------------------------
+# File helpers
+# ---------------------------------------------------------------------------
 
 def _read_uploaded_file(image_url):
-    """Resolve a Frappe file_url ('/private/files/foo.png' or '/files/foo.png')
+    """Resolve a Frappe file_url (/private/files/foo.png or /files/foo.png)
     to (bytes, mime_type)."""
     if not image_url:
-        raise _VendorError("MISSING_IMAGE", "No image was uploaded with the request.")
-
-    rows = frappe.get_all(
-        "File",
-        filters={"file_url": image_url},
-        fields=["name", "is_private", "file_name"],
-        limit=1,
-    )
-    if not rows:
-        raise _VendorError("MISSING_IMAGE", f"File {image_url} not found.")
-
-    is_private = bool(rows[0].get("is_private"))
-    fname = rows[0].get("file_name") or ""
-    base = get_files_path(is_private=is_private)
-    full = f"{base}/{fname}"
+        return None, None
+    import os
+    from frappe.utils.file_manager import get_file_path
     try:
-        with open(full, "rb") as f:
-            data = f.read()
-    except OSError as e:
-        raise _VendorError("MISSING_IMAGE", f"Could not read {full}: {e}")
+        path = get_file_path(image_url)
+    except Exception:
+        path = None
+    if not path or not os.path.exists(path):
+        # Try reading the File doc directly as a fallback.
+        files = frappe.get_all(
+            "File",
+            filters={"file_url": image_url},
+            fields=["name", "file_name"],
+            limit=1,
+        )
+        if not files:
+            raise _VendorError("FILE_MISSING", f"Could not load uploaded file {image_url}")
+        file_doc = frappe.get_doc("File", files[0]["name"])
+        return file_doc.get_content(), _guess_mime(file_doc.file_name)
 
-    mime = "image/jpeg"
-    low = fname.lower()
-    if low.endswith(".png"):
-        mime = "image/png"
-    elif low.endswith(".webp"):
-        mime = "image/webp"
-    elif low.endswith(".gif"):
-        mime = "image/gif"
-    return data, mime
+    with open(path, "rb") as f:
+        data = f.read()
+    return data, _guess_mime(path)
+
+
+def _guess_mime(filename):
+    f = (filename or "").lower()
+    if f.endswith(".png"):
+        return "image/png"
+    if f.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _save_result_image(name_prefix, content, mime="image/png"):
+    """Save bytes as a private Frappe File and return its file_url."""
+    from frappe.utils.file_manager import save_file
+    ext = "png" if mime == "image/png" else ("webp" if mime == "image/webp" else "jpg")
+    file_doc = save_file(
+        fname=f"{name_prefix}.{ext}",
+        content=content,
+        dt=None,
+        dn=None,
+        is_private=1,
+    )
+    return file_doc.file_url
 
 
 def _require_key(vendor):
     key = ai_cfg.get_api_key(vendor)
     if not key:
-        raise _AIDisabled(
-            f"{vendor} API key is not configured. Set it in AI Settings."
-        )
+        raise _AIDisabled(f"No API key configured for vendor {vendor}")
     return key
 
 
-# ── Floor plan (Google Gemini Flash, vision → JSON) ────────────────────────
+# ---------------------------------------------------------------------------
+# Floor plan (Gemini 2.0 Flash vision JSON)
+# ---------------------------------------------------------------------------
 
-_FLOOR_PLAN_PROMPT = """You are an assistant that extracts structured data from a residential floor plan image.
-
-Inspect the floor plan and respond with ONLY a JSON object — no prose, no markdown — matching this schema:
-
-{
-  "detected_area_sqft": <integer total covered area in square feet>,
-  "detected_dimensions": "<string e.g. '45ft x 40ft'>",
-  "detected_rooms": <integer total number of rooms incl. bedrooms, kitchen, bathrooms, living, dining>,
-  "confidence": <float 0..1>,
-  "confidence_level": "<one of: High, Medium, Low>",
-  "notes": "<one short sentence about anything unusual or unclear>"
-}
-
-Confidence rules:
-- High (>=0.85): all dimensions clearly labeled, layout unambiguous.
-- Medium (0.50..0.84): some values inferred from scale or partial labels.
-- Low (<0.50): significant guesswork; the image is unclear or not a residential floor plan.
-"""
+_FLOOR_PLAN_PROMPT = (
+    "You are an architect analyzing a residential floor plan image. "
+    "Identify the total covered area in square feet, the overall plot dimensions "
+    "as a 'A x B ft' string, and the count of distinct rooms. "
+    "Reply ONLY with this JSON: "
+    "{\"detected_area_sqft\": number, \"detected_dimensions\": string, "
+    "\"detected_rooms\": integer, \"confidence\": number_between_0_and_1, "
+    "\"confidence_level\": one of [\"High\",\"Medium\",\"Low\"], "
+    "\"notes\": string}"
+)
 
 
 def _run_floor_plan(doc, payload):
@@ -149,13 +175,18 @@ def _run_floor_plan(doc, payload):
 
     image_bytes, mime = _read_uploaded_file(payload.get("image_url"))
 
+    if vendor == "mock":
+        doc.model = "mock-floor-plan"
+        doc.tokens_input = 0
+        doc.tokens_output = 0
+        doc.cost_cents = 0
+        return _mock_floor_plan_response()
+
     if vendor == "gemini":
         text, usage = _gemini_vision(model, _FLOOR_PLAN_PROMPT, image_bytes, mime)
         doc.model = model
         doc.tokens_input = usage.get("input_tokens", 0)
         doc.tokens_output = usage.get("output_tokens", 0)
-        # Gemini 2.0 Flash pricing (rough): $0.10/M input, $0.40/M output tokens.
-        # Vision adds ~258 tokens per image; included in input count.
         doc.cost_cents = max(
             1,
             int(round(
@@ -165,11 +196,10 @@ def _run_floor_plan(doc, payload):
         )
         return _parse_floor_plan_response(text)
 
-    raise _AIDisabled(f"Floor-plan vendor '{vendor}' is not implemented yet.")
+    raise _AIDisabled(f"Floor-plan vendor {vendor} is not implemented yet.")
 
 
 def _gemini_vision(model, prompt, image_bytes, mime):
-    """Call Google Gemini multi-modal endpoint. Returns (text, usage)."""
     api_key = _require_key("gemini")
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -213,11 +243,9 @@ def _gemini_vision(model, prompt, image_bytes, mime):
 
 
 def _parse_floor_plan_response(text):
-    """Parse the LLM JSON output into the FRD §6.5 shape."""
     try:
         ai = json.loads(text)
     except json.JSONDecodeError:
-        # Last-ditch: extract the first {...} block.
         start = text.find("{")
         end = text.rfind("}")
         if start == -1 or end == -1:
@@ -233,113 +261,326 @@ def _parse_floor_plan_response(text):
             "confidence_level": ai.get("confidence_level", "Low"),
             "notes": ai.get("notes", ""),
         },
-        "estimate": None,  # Compute via /v1.estimate after user confirms values.
+        "estimate": None,
     }
 
 
-# ── Interior design (fal.ai FLUX-schnell, txt2img) ─────────────────────────
-
-def _run_interior_design(doc, payload):
-    cfg = ai_cfg.get_job_config("interior_design")
-    vendor = (cfg.get("vendor") or "fal").lower()
-    model = cfg.get("model") or "fal-ai/flux/schnell"
-
-    prompt = _build_interior_prompt(payload)
-
-    if vendor == "fal":
-        result, cost_cents = _fal_run(model, prompt)
-        doc.model = model
-        doc.cost_cents = cost_cents
-        return result
-
-    raise _AIDisabled(f"Interior vendor '{vendor}' is not implemented yet.")
+def _mock_floor_plan_response():
+    return {
+        "ai_result": {
+            "detected_area_sqft": 1450,
+            "detected_dimensions": "50 x 29 ft",
+            "detected_rooms": 7,
+            "confidence": 0.86,
+            "confidence_level": "High",
+            "notes": "Mock response - no real analysis performed.",
+        },
+        "estimate": None,
+    }
 
 
-def _build_interior_prompt(payload):
+# ---------------------------------------------------------------------------
+# Image edit (Gemini 2.5 Flash Image / Nano Banana)
+# ---------------------------------------------------------------------------
+
+# Per-tool prompt templates. Each receives a dict with style, room, color, notes
+# (any may be None) and returns a single string prompt.
+
+def _prompt_interior(p):
     parts = [
-        f"Photorealistic interior design of a {payload.get('room_type', 'living room')}",
-        f"in {payload.get('style', 'modern')} style",
+        f"Photorealistic interior redesign of this {p.get('room') or 'living room'}",
+        f"in {p.get('style') or 'modern'} style",
     ]
-    if payload.get("color_palette"):
-        parts.append(f"with {payload['color_palette']} colour palette")
-    if payload.get("notes"):
-        parts.append(payload["notes"])
-    parts.append("high detail, natural lighting, magazine quality")
+    if p.get("color"):
+        parts.append(f"with a {p['color']} color palette")
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append(
+        "Preserve the original room geometry, window positions and ceiling lines. "
+        "Replace only furniture, finishes and decor. Magazine quality, natural lighting."
+    )
     return ", ".join(parts)
 
 
-def _fal_run(model, prompt):
-    """Submit + poll fal.ai. Returns (result_dict, cost_cents)."""
-    api_key = _require_key("fal")
-    headers = {"Authorization": f"Key {api_key}"}
-
-    # Submit
-    submit_url = f"https://queue.fal.run/{model}"
-    try:
-        resp = requests.post(
-            submit_url,
-            headers=headers,
-            json={"prompt": prompt, "image_size": "square_hd", "num_images": 1},
-            timeout=60,
-        )
-    except requests.RequestException as e:
-        raise _VendorError("VENDOR_NETWORK", f"fal.ai request failed: {e}")
-    if resp.status_code not in (200, 202):
-        raise _VendorError(
-            "VENDOR_HTTP",
-            f"fal.ai returned {resp.status_code}: {resp.text[:300]}",
-        )
-    submission = resp.json()
-    request_id = submission.get("request_id")
-    if not request_id:
-        raise _VendorError("VENDOR_RESPONSE", "fal.ai submit missing request_id.")
-
-    status_url = submission.get("status_url") or (
-        f"https://queue.fal.run/{model}/requests/{request_id}/status"
+def _prompt_exterior(p):
+    parts = [
+        "Photorealistic exterior redesign of this building facade",
+        f"in {p.get('style') or 'modern'} style",
+    ]
+    if p.get("color"):
+        parts.append(f"with a {p['color']} color palette")
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append(
+        "Preserve the original building footprint, roof line, and window/door positions. "
+        "Change only cladding, paint, and exterior trim. Daylight, photoreal."
     )
-    response_url = submission.get("response_url") or (
-        f"https://queue.fal.run/{model}/requests/{request_id}"
+    return ", ".join(parts)
+
+
+def _prompt_garden(p):
+    parts = [
+        "Photorealistic landscape redesign of this outdoor area",
+        f"in {p.get('style') or 'tropical'} style",
+    ]
+    if p.get("color"):
+        parts.append(f"with a {p['color']} color tone")
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append(
+        "Keep the property boundary, hardscape paths and building edges unchanged. "
+        "Replace only planting, ground cover and outdoor furniture. Bright daylight."
+    )
+    return ", ".join(parts)
+
+
+def _prompt_layout(p):
+    parts = [
+        f"Rearrange the furniture in this {p.get('room') or 'room'} for better balance and flow",
+        f"keep the {p.get('style') or 'existing'} style",
+    ]
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append(
+        "Do not change wall colors, flooring or fixtures. Photorealistic, same camera angle."
+    )
+    return ", ".join(parts)
+
+
+def _prompt_cleanup(p):
+    parts = [
+        "Remove all clutter, personal items and visible cables from this scene",
+        "leave a clean, staged version of the same room",
+    ]
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append("Preserve furniture, finishes and lighting exactly.")
+    return ", ".join(parts)
+
+
+def _prompt_ref(p):
+    parts = [
+        "Apply the visual style of the provided reference image to this room",
+        f"keeping the {p.get('room') or 'room'} layout intact",
+    ]
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append("Photorealistic, magazine-quality result.")
+    return ", ".join(parts)
+
+
+def _prompt_paint(p):
+    parts = ["Repaint this scene"]
+    if p.get("color"):
+        parts.append(f"with a {p['color']} palette")
+    if p.get("style"):
+        parts.append(f"matching a {p['style']} aesthetic")
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append(
+        "Change only paint and visible wall/ceiling color. Preserve furniture, "
+        "flooring, fixtures, and natural light."
+    )
+    return ", ".join(parts)
+
+
+def _prompt_replace(p):
+    parts = ["Replace the masked object in this image"]
+    if p.get("notes"):
+        parts.append(f"with: {p['notes']}")
+    elif p.get("style"):
+        parts.append(f"with a {p['style']}-style alternative")
+    parts.append(
+        "Match the room lighting and perspective. Keep everything outside the mask unchanged."
+    )
+    return ", ".join(parts)
+
+
+def _prompt_floor(p):
+    parts = ["Replace only the flooring in this room"]
+    if p.get("style"):
+        parts.append(f"with a {p['style']} finish")
+    if p.get("color"):
+        parts.append(f"in {p['color']} tone")
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append(
+        "Keep walls, ceiling, furniture and fixtures unchanged. Photorealistic, correct reflections."
+    )
+    return ", ".join(parts)
+
+
+_PROMPT_BUILDERS = {
+    "interior": _prompt_interior,
+    "exterior": _prompt_exterior,
+    "garden":   _prompt_garden,
+    "layout":   _prompt_layout,
+    "cleanup":  _prompt_cleanup,
+    "ref":      _prompt_ref,
+    "paint":    _prompt_paint,
+    "replace":  _prompt_replace,
+    "floor":    _prompt_floor,
+}
+
+
+def _run_image_edit(doc, payload, tool_id):
+    cfg = ai_cfg.get_job_config(tool_id)
+    vendor = (cfg.get("vendor") or "mock").lower()
+    model = cfg.get("model") or "gemini-2.5-flash-image"
+
+    image_bytes, mime = _read_uploaded_file(payload.get("image_url"))
+    mask_bytes = mask_mime = None
+    ref_bytes = ref_mime = None
+    if payload.get("mask_url"):
+        mask_bytes, mask_mime = _read_uploaded_file(payload["mask_url"])
+    if payload.get("ref_image_url"):
+        ref_bytes, ref_mime = _read_uploaded_file(payload["ref_image_url"])
+
+    builder = _PROMPT_BUILDERS.get(tool_id)
+    if not builder:
+        raise _VendorError("UNKNOWN_TOOL", f"No prompt builder for tool {tool_id}")
+    prompt = builder({
+        "style": payload.get("style"),
+        "room":  payload.get("room"),
+        "color": payload.get("color"),
+        "notes": payload.get("notes"),
+    })
+
+    variations = int(doc.variation_count or 1)
+    hd = (doc.quality or "std").lower() == "hd"
+
+    if vendor == "mock":
+        doc.model = "mock-image-edit"
+        doc.cost_cents = 0
+        return _mock_image_edit(tool_id, payload, variations, prompt, hd)
+
+    if vendor == "gemini":
+        return _gemini_image_edit(
+            doc, model, prompt, image_bytes, mime,
+            mask_bytes, mask_mime, ref_bytes, ref_mime, variations, hd
+        )
+
+    if vendor == "fal":
+        raise _AIDisabled("fal.ai adapter not implemented yet - set vendor to gemini or mock.")
+
+    raise _AIDisabled(f"Image-edit vendor {vendor} is not implemented yet.")
+
+
+def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
+                       mask_bytes, mask_mime, ref_bytes, ref_mime,
+                       variations, hd):
+    """Call Gemini 2.5 Flash Image up to [variations] times in parallel.
+
+    Returns the worker result dict {"images": [...], "prompt": str, "model": str}.
+    """
+    api_key = _require_key("gemini")
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
     )
 
-    # Poll
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        try:
-            s = requests.get(status_url, headers=headers, timeout=15)
-        except requests.RequestException as e:
-            raise _VendorError("VENDOR_NETWORK", f"fal.ai poll failed: {e}")
-        sj = s.json() if s.status_code == 200 else {}
-        if sj.get("status") in ("COMPLETED", "OK"):
-            break
-        if sj.get("status") in ("FAILED", "ERROR"):
-            raise _VendorError("VENDOR_FAILED", f"fal.ai job failed: {sj}")
-        time.sleep(1.5)
-    else:
-        raise _VendorError("VENDOR_TIMEOUT", "fal.ai did not finish in 120s.")
+    parts = [{"text": prompt}]
+    if mask_bytes:
+        parts.append({"text": "The white pixels in the next image are the mask region to edit; ignore everything else."})
+        parts.append({"inline_data": {"mime_type": mask_mime or "image/png",
+                                       "data": base64.b64encode(mask_bytes).decode("ascii")}})
+    if ref_bytes:
+        parts.append({"text": "Use the next image as a style reference."})
+        parts.append({"inline_data": {"mime_type": ref_mime or "image/jpeg",
+                                       "data": base64.b64encode(ref_bytes).decode("ascii")}})
+    parts.append({"inline_data": {"mime_type": mime or "image/jpeg",
+                                   "data": base64.b64encode(image_bytes).decode("ascii")}})
 
-    # Fetch
-    try:
-        r = requests.get(response_url, headers=headers, timeout=30)
-    except requests.RequestException as e:
-        raise _VendorError("VENDOR_NETWORK", f"fal.ai fetch failed: {e}")
-    if r.status_code != 200:
-        raise _VendorError(
-            "VENDOR_HTTP",
-            f"fal.ai response returned {r.status_code}: {r.text[:300]}",
-        )
-    body = r.json()
-
-    images = body.get("images") or []
-    image_url = images[0]["url"] if images and isinstance(images[0], dict) else ""
-
-    # FLUX-schnell on fal.ai: ~$0.003 per megapixel; 1024x1024 ≈ 1 MP.
-    cost_cents = 1
-    return (
-        {
-            "image_url": image_url,
-            "suggestions": [],
-            "palette": [],
-            "seed": body.get("seed"),
+    body_template = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": 0.8,
+            "responseModalities": ["IMAGE"],
         },
-        cost_cents,
-    )
+    }
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _call_once(idx):
+        body = json.loads(json.dumps(body_template))
+        body["generationConfig"]["seed"] = 1000 + idx * 17
+        try:
+            resp = requests.post(url, json=body, timeout=120)
+        except requests.RequestException as e:
+            raise _VendorError("VENDOR_NETWORK", f"Gemini request failed: {e}")
+        if resp.status_code != 200:
+            raise _VendorError(
+                "VENDOR_HTTP",
+                f"Gemini returned {resp.status_code}: {resp.text[:300]}",
+            )
+        return resp.json()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(4, variations)) as ex:
+        for r in ex.map(_call_once, range(variations)):
+            results.append(r)
+
+    images = []
+    total_tokens_in = 0
+    total_tokens_out = 0
+    for i, data in enumerate(results):
+        try:
+            cand = data["candidates"][0]
+            inline = None
+            for p in cand["content"]["parts"]:
+                if "inline_data" in p:
+                    inline = p["inline_data"]
+                    break
+                if "inlineData" in p:
+                    inline = p["inlineData"]
+                    break
+            if not inline:
+                raise _VendorError("VENDOR_RESPONSE", f"Gemini response had no image part: {data}")
+            img_bytes = base64.b64decode(inline.get("data") or inline.get("data_b64") or "")
+            img_mime = inline.get("mime_type") or inline.get("mimeType") or "image/png"
+            url_saved = _save_result_image(f"ai_{doc.name}_v{i}", img_bytes, img_mime)
+            images.append({"url": url_saved, "thumb_url": url_saved, "seed": 1000 + i * 17})
+        except (KeyError, IndexError):
+            raise _VendorError("VENDOR_RESPONSE", f"Unexpected Gemini shape: {data}")
+        usage = data.get("usageMetadata") or {}
+        total_tokens_in += int(usage.get("promptTokenCount", 0))
+        total_tokens_out += int(usage.get("candidatesTokenCount", 0))
+
+    doc.model = model
+    doc.tokens_input = total_tokens_in
+    doc.tokens_output = total_tokens_out
+    # Gemini 2.5 Flash Image lists at ~$0.039/image. Add 50% for HD as a buffer
+    # (Google may bill more for larger outputs).
+    per_image_cents = int(round(3.9 * (1.5 if hd else 1.0)))
+    doc.cost_cents = max(1, per_image_cents * len(images))
+
+    return {"images": images, "prompt": prompt, "model": model, "hd": hd}
+
+
+def _mock_image_edit(tool_id, payload, variations, prompt, hd):
+    """Return [variations] stock placeholder image URLs.
+
+    The mock uses placehold.co (a public placeholder service). When you
+    flip the vendor to 'gemini' on a real key, these are replaced with
+    actual Nano Banana outputs without any other code change.
+    """
+    style = (payload.get("style") or "mock").replace(" ", "+")
+    size = "2048x2048" if hd else "1024x1024"
+    images = []
+    palette = ["#1f2937", "#374151", "#4b5563", "#6b7280"]
+    for i in range(variations):
+        bg = palette[i % len(palette)].lstrip("#")
+        url = f"https://placehold.co/{size}/{bg}/F4EFE6?text={tool_id}+%7C+{style}+%7C+V{i+1}"
+        images.append({"url": url, "thumb_url": url, "seed": 1000 + i * 17})
+    return {"images": images, "prompt": prompt, "model": "mock-image-edit", "hd": hd}
+
+
+# ---------------------------------------------------------------------------
+# Legacy fal.ai stub kept only for back-compat with the old interior endpoint.
+# Returns a stock placeholder until a fal adapter is wired.
+# ---------------------------------------------------------------------------
+
+def _run_interior_design(doc, payload):
+    """Legacy entrypoint - the old ai_interior_generate endpoint still uses
+    this. Internally we now route via _run_image_edit with tool_id=interior."""
+    return _run_image_edit(doc, payload, "interior")

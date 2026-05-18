@@ -17,20 +17,13 @@
     "fal_api_key",
     "anthropic_api_key",
     "openai_api_key",
-    "floor_plan_section",
-    "floor_plan_vendor",
-    "floor_plan_model",
-    "floor_plan_max_cost_cents",
-    "floor_plan_daily_budget_cents",
-    "floor_plan_monthly_budget_cents",
-    "floor_plan_rate_limit_per_min",
-    "interior_section",
-    "interior_vendor",
-    "interior_model",
-    "interior_max_cost_cents",
-    "interior_daily_budget_cents",
-    "interior_monthly_budget_cents",
-    "interior_rate_limit_per_min"
+    "tool_configs_section",
+    "tool_configs",
+    "hd_section",
+    "hd_resolution",
+    "hd_cost_multiplier",
+    "premium_section",
+    "premium_users"
   ],
   "fields": [
     {
@@ -48,8 +41,7 @@
     {
       "fieldname": "alert_email",
       "fieldtype": "Data",
-      "label": "Budget alert email",
-      "description": "Notified when usage crosses alert_threshold_percent of any budget."
+      "label": "Budget alert email"
     },
     {
       "fieldname": "alert_threshold_percent",
@@ -60,16 +52,16 @@
     {
       "fieldname": "global_daily_budget_cents",
       "fieldtype": "Int",
-      "default": "500",
+      "default": "1000",
       "label": "Global daily budget (cents)",
-      "description": "Combined cap across all AI job types per day. 0 = unlimited."
+      "description": "Combined cap across all AI job types per day. 0 = unlimited. Default $10/day."
     },
     {
       "fieldname": "global_monthly_budget_cents",
       "fieldtype": "Int",
-      "default": "10000",
+      "default": "20000",
       "label": "Global monthly budget (cents)",
-      "description": "Combined cap across all AI job types per month. 0 = unlimited."
+      "description": "Combined cap across all AI job types per month. 0 = unlimited. Default $200/month."
     },
     {
       "fieldname": "kill_switch_until",
@@ -104,92 +96,50 @@
       "label": "OpenAI API key"
     },
     {
-      "fieldname": "floor_plan_section",
+      "fieldname": "tool_configs_section",
       "fieldtype": "Section Break",
-      "label": "Floor plan"
+      "label": "Tool configuration",
+      "description": "One row per AI tool. Each tool dispatches to its configured vendor; vendor 'mock' returns a stock image for dev without spend."
     },
     {
-      "fieldname": "floor_plan_vendor",
-      "fieldtype": "Select",
-      "options": "gemini\nopenai\nanthropic",
-      "default": "gemini",
-      "label": "Vendor"
+      "fieldname": "tool_configs",
+      "fieldtype": "Table",
+      "options": "AI Tool Config",
+      "label": "Tool configs"
     },
     {
-      "fieldname": "floor_plan_model",
-      "fieldtype": "Data",
-      "default": "gemini-2.0-flash",
-      "label": "Model"
-    },
-    {
-      "fieldname": "floor_plan_max_cost_cents",
-      "fieldtype": "Int",
-      "default": "5",
-      "label": "Max cost per request (cents)",
-      "description": "Hard cap per single job. If estimated cost exceeds this, request is rejected pre-call."
-    },
-    {
-      "fieldname": "floor_plan_daily_budget_cents",
-      "fieldtype": "Int",
-      "default": "200",
-      "label": "Daily budget (cents)"
-    },
-    {
-      "fieldname": "floor_plan_monthly_budget_cents",
-      "fieldtype": "Int",
-      "default": "5000",
-      "label": "Monthly budget (cents)"
-    },
-    {
-      "fieldname": "floor_plan_rate_limit_per_min",
-      "fieldtype": "Int",
-      "default": "5",
-      "label": "Rate limit (requests/min/user)"
-    },
-    {
-      "fieldname": "interior_section",
+      "fieldname": "hd_section",
       "fieldtype": "Section Break",
-      "label": "Interior design"
+      "label": "HD output (premium)"
     },
     {
-      "fieldname": "interior_vendor",
-      "fieldtype": "Select",
-      "options": "fal\nreplicate\ntogether",
-      "default": "fal",
-      "label": "Vendor"
-    },
-    {
-      "fieldname": "interior_model",
-      "fieldtype": "Data",
-      "default": "fal-ai/flux/schnell",
-      "label": "Model"
-    },
-    {
-      "fieldname": "interior_max_cost_cents",
+      "fieldname": "hd_resolution",
       "fieldtype": "Int",
-      "default": "10",
-      "label": "Max cost per request (cents)"
+      "default": "2048",
+      "label": "HD resolution (px)",
+      "description": "Output edge size when quality=hd is requested. Premium-only."
     },
     {
-      "fieldname": "interior_daily_budget_cents",
-      "fieldtype": "Int",
-      "default": "300",
-      "label": "Daily budget (cents)"
+      "fieldname": "hd_cost_multiplier",
+      "fieldtype": "Float",
+      "default": "2.0",
+      "label": "HD cost multiplier",
+      "description": "Cost-cap multiplier applied when quality=hd is requested."
     },
     {
-      "fieldname": "interior_monthly_budget_cents",
-      "fieldtype": "Int",
-      "default": "5000",
-      "label": "Monthly budget (cents)"
+      "fieldname": "premium_section",
+      "fieldtype": "Section Break",
+      "label": "Premium users"
     },
     {
-      "fieldname": "interior_rate_limit_per_min",
-      "fieldtype": "Int",
-      "default": "5",
-      "label": "Rate limit (requests/min/user)"
+      "fieldname": "premium_users",
+      "fieldtype": "Table",
+      "options": "User Premium Entry",
+      "label": "Premium users",
+      "description": "Users with premium access (unlimited daily quota, HD output unlocked)."
     }
   ],
-  "modified": "2026-05-06 00:00:00.000000",
+  "modified": "2026-05-18 00:00:00.000000",
   "modified_by": "Administrator",
   "module": "construction",
   "name": "AI Settings",

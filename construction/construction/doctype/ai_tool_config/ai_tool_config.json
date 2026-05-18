@@ -1,0 +1,121 @@
+{
+  "actions": [],
+  "creation": "2026-05-18 00:00:00.000000",
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "istable": 1,
+  "field_order": [
+    "tool_id",
+    "enabled",
+    "premium_only",
+    "column_break_vendor",
+    "vendor",
+    "model",
+    "hd_supported",
+    "section_break_budget",
+    "max_cost_cents",
+    "daily_budget_cents",
+    "monthly_budget_cents",
+    "column_break_limits",
+    "rate_limit_per_min",
+    "free_daily_limit"
+  ],
+  "fields": [
+    {
+      "fieldname": "tool_id",
+      "fieldtype": "Select",
+      "options": "floor_plan\ninterior\nexterior\ngarden\nlayout\ncleanup\nref\npaint\nreplace\nfloor",
+      "reqd": 1,
+      "in_list_view": 1,
+      "label": "Tool ID"
+    },
+    {
+      "fieldname": "enabled",
+      "fieldtype": "Check",
+      "default": "1",
+      "in_list_view": 1,
+      "label": "Enabled"
+    },
+    {
+      "fieldname": "premium_only",
+      "fieldtype": "Check",
+      "default": "0",
+      "in_list_view": 1,
+      "label": "Premium only",
+      "description": "If checked, only users with is_premium=1 may invoke this tool."
+    },
+    {
+      "fieldname": "column_break_vendor",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "vendor",
+      "fieldtype": "Select",
+      "options": "gemini\nfal\nopenai\nanthropic\nmock",
+      "default": "mock",
+      "in_list_view": 1,
+      "label": "Vendor"
+    },
+    {
+      "fieldname": "model",
+      "fieldtype": "Data",
+      "in_list_view": 1,
+      "label": "Model"
+    },
+    {
+      "fieldname": "hd_supported",
+      "fieldtype": "Check",
+      "default": "1",
+      "label": "HD supported",
+      "description": "If checked, the tool accepts quality=hd (2048×2048) on premium accounts."
+    },
+    {
+      "fieldname": "section_break_budget",
+      "fieldtype": "Section Break",
+      "label": "Budget & limits"
+    },
+    {
+      "fieldname": "max_cost_cents",
+      "fieldtype": "Int",
+      "default": "20",
+      "label": "Max cost per request (cents)"
+    },
+    {
+      "fieldname": "daily_budget_cents",
+      "fieldtype": "Int",
+      "default": "111",
+      "label": "Daily budget (cents)"
+    },
+    {
+      "fieldname": "monthly_budget_cents",
+      "fieldtype": "Int",
+      "default": "2222",
+      "label": "Monthly budget (cents)"
+    },
+    {
+      "fieldname": "column_break_limits",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "rate_limit_per_min",
+      "fieldtype": "Int",
+      "default": "5",
+      "label": "Rate limit (req/min/user)"
+    },
+    {
+      "fieldname": "free_daily_limit",
+      "fieldtype": "Int",
+      "default": "5",
+      "label": "Free-tier daily limit (per user)",
+      "description": "Max generations per day for non-premium users. 0 = unlimited."
+    }
+  ],
+  "modified": "2026-05-18 00:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "construction",
+  "name": "AI Tool Config",
+  "owner": "Administrator",
+  "permissions": [],
+  "sort_field": "modified",
+  "sort_order": "DESC"
+}

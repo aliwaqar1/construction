@@ -47,6 +47,7 @@ def resolve_estimate(country, city, plot_size_sqft, covered_area_sqft, answers):
     covered_area_sqft = float(covered_area_sqft)
 
     floor_areas = _extract_floor_areas(answers, covered_area_sqft)
+    user_rate_overrides = _extract_rate_overrides(answers)
 
     # 1. Load questionnaire
     q_doc = frappe.get_all(
@@ -67,7 +68,12 @@ def resolve_estimate(country, city, plot_size_sqft, covered_area_sqft, answers):
         frappe.throw(f"No calculator registered for country '{country}'")
 
     return calculator(
-        city, plot_size_sqft, covered_area_sqft, params, floor_areas=floor_areas
+        city,
+        plot_size_sqft,
+        covered_area_sqft,
+        params,
+        floor_areas=floor_areas,
+        user_rate_overrides=user_rate_overrides,
     )
 
 
@@ -90,6 +96,29 @@ def _extract_floor_areas(answers, covered_area_sqft):
         if floors:
             return floors
     return [covered_area_sqft]
+
+
+def _extract_rate_overrides(answers):
+    """Pull Pro per-material rate overrides out of answers.
+
+    Shape: {material_key: number}. Recognised keys: gray_per_sqft,
+    finish_per_sqft, cement_bag, saria_kg, brick. Unknown keys
+    are forwarded to calculators verbatim so future overrides do not require
+    an engine update.
+    """
+    raw = (answers or {}).get("rate_overrides")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for k, v in raw.items():
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f > 0:
+            out[str(k)] = f
+    return out
+
 
 
 # ---------------------------------------------------------------------------

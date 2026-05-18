@@ -685,23 +685,19 @@ def compare_estimates(a=None, b=None):
 
 
 # ============================================================================
-
-# ============================================================================
-# PHASE 2 - AI (all 9 design tools + floor plan)
+# PHASE 2 - AI (floor plan + interior design)
 # ============================================================================
 #
 # Architecture:
-#   client -> POST ai_generate (multipart: image + tool_id + style + ...)
+#   client -> POST analyze/generate (multipart for files, JSON for prompts)
 #          -> AI Job doc created (status=queued) -> RQ worker
 #          -> client polls /job_status until done|failed
-#          -> client optionally POSTs ai_save_design to persist a result
 #
-# Kill switches: Feature Flag flag_key per tool (ai_floor_plan, ai_interior, ...)
+# Kill switches: Feature Flag flag_key {ai_floor_plan, ai_interior_design}
 #                + AI Settings.enabled + AI Settings.kill_switch_until
-# Rate limit:    per-user per-minute, configured in AI Tool Config
-# Free quota:    per-user per-day generation counter for non-premium users
-# Budgets:       per-tool daily/monthly + global daily/monthly caps. Auto-trips
-#                kill switch when hit.
+# Rate limit:    per-user per-minute, configured in AI Settings
+# Budgets:       per-job-type and global daily/monthly caps in AI Settings.
+#                Auto-trips kill switch when hit.
 # Idempotency:   Idempotency-Key header (or body fallback). (user, key) is
 #                unique on AI Job; duplicate submits return the original job.
 # ============================================================================
@@ -711,20 +707,7 @@ from construction.construction.doctype.ai_settings import ai_settings as ai_cfg
 
 _AI_FLAGS = {
     "floor_plan": "ai_floor_plan",
-    "interior": "ai_interior",
-    "exterior": "ai_exterior",
-    "garden": "ai_garden",
-    "layout": "ai_layout",
-    "cleanup": "ai_cleanup",
-    "ref": "ai_ref",
-    "paint": "ai_paint",
-    "replace": "ai_replace",
-    "floor": "ai_floor",
-}
-
-# Legacy aliases - clients on older builds may still post "interior_design".
-_TOOL_ALIASES = {
-    "interior_design": "interior",
+    "interior_design": "ai_interior_design",
 }
 
 
@@ -733,10 +716,10 @@ def _flag_enabled(key):
     return bool(enabled)
 
 
-def _rate_limit_check(user, tool_id, limit_per_min):
+def _rate_limit_check(user, job_type, limit_per_min):
     if not limit_per_min or limit_per_min <= 0:
         return True
-    key = f"ai_rl:{tool_id}:{user}"
+    key = f"ai_rl:{job_type}:{user}"
     cache = frappe.cache()
     current = cache.get_value(key) or 0
     try:
@@ -749,69 +732,42 @@ def _rate_limit_check(user, tool_id, limit_per_min):
     return True
 
 
-def _free_quota_check(user, tool_id, free_daily_limit):
-    """Per-user per-day generation counter for non-premium users.
-    Returns (ok: bool, remaining_today: int). Premium bypasses the cap."""
-    if not free_daily_limit or free_daily_limit <= 0:
-        return True, -1
-    if ai_cfg.is_premium(user):
-        return True, -1
-    from frappe.utils import nowdate
-    key = f"ai_free:{user}:{nowdate()}"
-    cache = frappe.cache()
-    current = cache.get_value(key) or 0
-    try:
-        current = int(current)
-    except (TypeError, ValueError):
-        current = 0
-    if current >= free_daily_limit:
-        return False, 0
-    return True, free_daily_limit - current
-
-
-def _free_quota_increment(user):
-    from frappe.utils import nowdate
-    key = f"ai_free:{user}:{nowdate()}"
-    cache = frappe.cache()
-    current = cache.get_value(key) or 0
-    try:
-        current = int(current)
-    except (TypeError, ValueError):
-        current = 0
-    cache.set_value(key, current + 1, expires_in_sec=60 * 60 * 36)
-
-
 def _canonical_request_hash(payload):
     canonical = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _spend_in_window(tool_id, since):
+def _spend_in_window(job_type, since):
+    """Sum cost_cents across AI Jobs of [job_type] (or all when None)
+    completed since [since]."""
     filters = {"completed_at": [">=", since]}
-    if tool_id:
-        filters["job_type"] = tool_id
+    if job_type:
+        filters["job_type"] = job_type
     rows = frappe.get_all(
         "AI Job", filters=filters, fields=["cost_cents"], limit_page_length=0
     )
     return sum((r.get("cost_cents") or 0) for r in rows)
 
 
-def _check_budgets(tool_id, cfg):
+def _check_budgets(job_type, cfg):
+    """Enforce per-job-type + global daily/monthly caps. Returns an error
+    dict on breach (and trips the kill switch), or None on clear path."""
     from frappe.utils import add_to_date, now_datetime
 
     now = now_datetime()
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = day_start.replace(day=1)
 
+    # Per-job-type caps
     job_daily = cfg.get("daily_budget_cents") or 0
     job_monthly = cfg.get("monthly_budget_cents") or 0
 
     if job_daily:
-        spent = _spend_in_window(tool_id, day_start)
+        spent = _spend_in_window(job_type, day_start)
         if spent >= job_daily:
             ai_cfg.trip_kill_switch(
                 hours=24,
-                reason=f"{tool_id} daily budget exceeded ({spent}/{job_daily}c)",
+                reason=f"{job_type} daily budget exceeded ({spent}/{job_daily}¢)",
             )
             return _error_response(
                 "BUDGET_EXCEEDED",
@@ -819,12 +775,13 @@ def _check_budgets(tool_id, cfg):
                 429,
             )
     if job_monthly:
-        spent = _spend_in_window(tool_id, month_start)
+        spent = _spend_in_window(job_type, month_start)
         if spent >= job_monthly:
+            # Trip until next month start.
             hours = max(1, int((add_to_date(month_start, months=1) - now).total_seconds() // 3600))
             ai_cfg.trip_kill_switch(
                 hours=hours,
-                reason=f"{tool_id} monthly budget exceeded ({spent}/{job_monthly}c)",
+                reason=f"{job_type} monthly budget exceeded ({spent}/{job_monthly}¢)",
             )
             return _error_response(
                 "BUDGET_EXCEEDED",
@@ -832,6 +789,7 @@ def _check_budgets(tool_id, cfg):
                 429,
             )
 
+    # Global caps
     settings = ai_cfg.get_settings()
     g_daily = settings.global_daily_budget_cents or 0
     g_monthly = settings.global_monthly_budget_cents or 0
@@ -841,23 +799,29 @@ def _check_budgets(tool_id, cfg):
         if spent >= g_daily:
             ai_cfg.trip_kill_switch(
                 hours=24,
-                reason=f"Global daily budget exceeded ({spent}/{g_daily}c)",
+                reason=f"Global daily budget exceeded ({spent}/{g_daily}¢)",
             )
-            return _error_response("BUDGET_EXCEEDED", "Daily AI budget reached.", 429)
+            return _error_response(
+                "BUDGET_EXCEEDED", "Daily AI budget reached.", 429
+            )
     if g_monthly:
         spent = _spend_in_window(None, month_start)
         if spent >= g_monthly:
             hours = max(1, int((add_to_date(month_start, months=1) - now).total_seconds() // 3600))
             ai_cfg.trip_kill_switch(
                 hours=hours,
-                reason=f"Global monthly budget exceeded ({spent}/{g_monthly}c)",
+                reason=f"Global monthly budget exceeded ({spent}/{g_monthly}¢)",
             )
-            return _error_response("BUDGET_EXCEEDED", "Monthly AI budget reached.", 429)
+            return _error_response(
+                "BUDGET_EXCEEDED", "Monthly AI budget reached.", 429
+            )
 
     return None
 
 
 def _idempotency_key_from_request(data):
+    """Prefer the `Idempotency-Key` HTTP header (RFC draft), fall back to a
+    body field for legacy clients."""
     if frappe.request and frappe.request.headers:
         hdr = frappe.request.headers.get("Idempotency-Key") or frappe.request.headers.get("X-Idempotency-Key")
         if hdr:
@@ -865,21 +829,23 @@ def _idempotency_key_from_request(data):
     return data.get("idempotency_key") if isinstance(data, dict) else None
 
 
-def _save_uploaded_file(field_name):
-    """If the request has a multipart file under [field_name], persist it as a
-    private File and return its file_url. Returns None when absent, or a
-    forwarded error response dict when oversized."""
+def _save_uploaded_image():
+    """If the request contains a multipart file under 'image' or 'file',
+    persist it as a private File and return its file_url. Returns None
+    when no file is attached."""
     if not (frappe.request and frappe.request.files):
         return None
-    upload = frappe.request.files.get(field_name)
+    upload = frappe.request.files.get("image") or frappe.request.files.get("file")
     if not upload:
         return None
+
     content = upload.read()
     if len(content) > 10 * 1024 * 1024:
-        return _error_response("FILE_TOO_LARGE", "Image must be 10 MB or less", 413)
+        return _error_response("FILE_TOO_LARGE", "Image must be ≤ 10 MB", 413)
+
     from frappe.utils.file_manager import save_file
     file_doc = save_file(
-        fname=upload.filename or f"ai_{field_name}.bin",
+        fname=upload.filename or "ai_upload.bin",
         content=content,
         dt=None,
         dn=None,
@@ -889,17 +855,13 @@ def _save_uploaded_file(field_name):
 
 
 def _normalize_status(s):
+    """Translate server-side 'succeeded' to the client-facing 'done' the
+    Flutter app expects."""
     return "done" if s == "succeeded" else s
 
 
-def _resolve_tool_id(raw):
-    if not raw:
-        return None
-    return _TOOL_ALIASES.get(raw, raw)
-
-
-def _ai_submit(tool_id, body, extra_payload):
-    """Shared submit pipeline for every AI tool."""
+def _ai_submit(job_type, extra_payload):
+    """Shared submit pipeline for both AI flows."""
     try:
         _require_auth()
     except frappe.AuthenticationError:
@@ -908,58 +870,30 @@ def _ai_submit(tool_id, body, extra_payload):
     if not ai_cfg.is_master_enabled():
         return _error_response("AI_DISABLED", "AI is currently disabled", 503)
 
-    flag = _AI_FLAGS.get(tool_id)
+    flag = _AI_FLAGS.get(job_type)
     if not flag or not _flag_enabled(flag):
         return _error_response(
             "AI_DISABLED",
-            f"AI tool {tool_id} is currently unavailable",
+            f"AI feature '{job_type}' is currently unavailable",
             503,
         )
 
-    try:
-        cfg = ai_cfg.get_job_config(tool_id)
-    except ValueError:
-        return _error_response("INVALID_TOOL", f"Unknown AI tool {tool_id}", 400)
+    cfg = ai_cfg.get_job_config(job_type)
 
-    if not cfg.get("enabled"):
-        return _error_response("AI_DISABLED", f"Tool {tool_id} disabled", 503)
-
-    user = frappe.session.user
-
-    if cfg.get("premium_only") and not ai_cfg.is_premium(user):
-        return _error_response(
-            "PREMIUM_REQUIRED",
-            "This tool is available to premium users only.",
-            402,
-        )
-
-    quality = (body.get("quality") or "std").lower()
-    if quality == "hd":
-        if not ai_cfg.is_premium(user):
-            return _error_response("PREMIUM_REQUIRED", "HD output is premium-only.", 402)
-        if not cfg.get("hd_supported"):
-            return _error_response("HD_NOT_SUPPORTED", "This tool does not support HD output.", 400)
-
-    if not _rate_limit_check(user, tool_id, cfg.get("rate_limit_per_min")):
+    if not _rate_limit_check(
+        frappe.session.user, job_type, cfg.get("rate_limit_per_min")
+    ):
         return _error_response(
             "RATE_LIMITED",
-            "Too many requests. Please slow down.",
+            "You're sending requests too fast. Please slow down.",
             429,
         )
 
-    ok, remaining = _free_quota_check(user, tool_id, cfg.get("free_daily_limit"))
-    if not ok:
-        return _error_response(
-            "FREE_QUOTA_EXCEEDED",
-            "Daily free AI quota reached. Upgrade to premium for unlimited generations.",
-            429,
-            details={"remaining_today": 0},
-        )
-
-    budget_err = _check_budgets(tool_id, cfg)
+    budget_err = _check_budgets(job_type, cfg)
     if budget_err is not None:
         return budget_err
 
+    body = _read_json_body() or {}
     idempotency_key = _idempotency_key_from_request(body)
     if not idempotency_key:
         return _error_response(
@@ -969,7 +903,7 @@ def _ai_submit(tool_id, body, extra_payload):
 
     existing = frappe.db.get_value(
         "AI Job",
-        {"user": user, "idempotency_key": idempotency_key},
+        {"user": frappe.session.user, "idempotency_key": idempotency_key},
         "name",
     )
     if existing:
@@ -979,28 +913,15 @@ def _ai_submit(tool_id, body, extra_payload):
     payload.update(extra_payload or {})
 
     try:
-        variations = int(body.get("variations") or 1)
-    except (TypeError, ValueError):
-        variations = 1
-    variations = max(1, min(4, variations))
-
-    try:
         doc = frappe.new_doc("AI Job")
-        doc.job_type = tool_id
+        doc.job_type = job_type
         doc.status = "queued"
-        doc.user = user
+        doc.user = frappe.session.user
         doc.idempotency_key = idempotency_key
         doc.request_hash = _canonical_request_hash(payload)
         doc.request_payload_json = json.dumps(payload)
-        doc.quality = quality
-        doc.variation_count = variations
-        doc.source_image_url = extra_payload.get("image_url") if extra_payload else None
-        doc.mask_url = extra_payload.get("mask_url") if extra_payload else None
-        doc.ref_image_url = extra_payload.get("ref_image_url") if extra_payload else None
         doc.insert(ignore_permissions=True)
         frappe.db.commit()
-
-        _free_quota_increment(user)
 
         frappe.enqueue(
             "construction.api.ai_worker.run_job",
@@ -1011,7 +932,7 @@ def _ai_submit(tool_id, body, extra_payload):
 
         return _ai_status_payload(doc.name)
     except Exception:
-        frappe.log_error(traceback.format_exc(), f"v1.ai_submit:{tool_id}")
+        frappe.log_error(traceback.format_exc(), f"v1.ai_submit:{job_type}")
         return _error_response("SERVER_ERROR", "Failed to enqueue AI job", 500)
 
 
@@ -1030,75 +951,21 @@ def _ai_status_payload(name):
             else None
         ),
         "cost_cents": doc.cost_cents or 0,
-        "quality": doc.quality or "std",
-        "variation_count": doc.variation_count or 1,
         "started_at": str(doc.started_at) if doc.started_at else None,
         "completed_at": str(doc.completed_at) if doc.completed_at else None,
     }
 
 
 @frappe.whitelist(methods=["POST"])
-def ai_generate(**kwargs):
-    """Unified AI generation endpoint for all 9 design tools.
-
-    Multipart body:
-        tool_id      interior | exterior | garden | layout | cleanup | ref | paint | replace | floor
-        image        <file>         required for all 9
-        style        <slug>         required
-        room         <slug>         required iff tool_id == interior
-        color        <slug>         optional
-        notes        <free text>    optional
-        quality      std | hd       default std; hd is premium-only
-        variations   1..4           default 1; clamped to 4
-        mask         <file>         optional (cleanup, replace)
-        ref_image    <file>         optional (ref tool)
-
-    Header: Idempotency-Key: <uuid>
-    """
-    form = frappe.request.form if (frappe.request and frappe.request.form) else {}
-    body = dict(form)
-    tool_id = _resolve_tool_id(body.get("tool_id"))
-    if not tool_id or tool_id not in _AI_FLAGS:
-        return _error_response("INVALID_TOOL", "Missing or unknown tool_id", 400)
-    if tool_id == "floor_plan":
-        return _error_response(
-            "INVALID_TOOL",
-            "Use ai_floor_plan_analyze for floor plan analysis.",
-            400,
-        )
-
-    image_url = _save_uploaded_file("image")
-    if isinstance(image_url, dict) and image_url.get("ok") is False:
-        return image_url
-    if not image_url:
-        return _error_response("MISSING_IMAGE", "A source image is required.", 400)
-
-    extras = {"image_url": image_url}
-    mask_url = _save_uploaded_file("mask")
-    if isinstance(mask_url, dict) and mask_url.get("ok") is False:
-        return mask_url
-    if mask_url:
-        extras["mask_url"] = mask_url
-
-    ref_url = _save_uploaded_file("ref_image")
-    if isinstance(ref_url, dict) and ref_url.get("ok") is False:
-        return ref_url
-    if ref_url:
-        extras["ref_image_url"] = ref_url
-
-    return _ai_submit(tool_id, body, extras)
-
-
-@frappe.whitelist(methods=["POST"])
 def ai_floor_plan_analyze(**kwargs):
-    """Submit a floor-plan image for AI analysis (vision JSON, not image edit).
+    """Submit a floor-plan image for AI analysis.
 
     Multipart fields: image=<file>, city=<str>, quality_level=<str>
     Header: Idempotency-Key: <uuid>
     """
-    image_url = _save_uploaded_file("image")
+    image_url = _save_uploaded_image()
     if isinstance(image_url, dict) and image_url.get("ok") is False:
-        return image_url
+        return image_url  # forwarded error response
 
     extras = {}
     if image_url:
@@ -1108,20 +975,17 @@ def ai_floor_plan_analyze(**kwargs):
             val = frappe.request.form.get(key)
             if val:
                 extras[key] = val
-
-    body = dict(frappe.request.form) if (frappe.request and frappe.request.form) else {}
-    return _ai_submit("floor_plan", body, extras)
+    return _ai_submit("floor_plan", extras)
 
 
 @frappe.whitelist(methods=["POST"])
 def ai_interior_generate(**kwargs):
-    """Legacy interior endpoint - accepts JSON body without a source image.
+    """Submit an interior-design generation request.
 
-    Kept for the legacy interior_design_page in the Flutter app. New clients
-    should use /ai_generate with tool_id=interior and a source image.
+    Body (JSON): {room_type, style, color_palette?, notes?}
+    Header: Idempotency-Key: <uuid>
     """
-    body = _read_json_body() or {}
-    return _ai_submit("interior", body, {})
+    return _ai_submit("interior_design", None)
 
 
 @frappe.whitelist()
@@ -1133,13 +997,13 @@ def job_status(id=None, job_id=None):
         return _error_response("UNAUTHORIZED", "Authentication required", 401)
     name = id or job_id
     if not name:
-        return _error_response("MISSING_PARAMS", "id is required")
+        return _error_response("MISSING_PARAMS", "'id' is required")
     if not frappe.db.exists("AI Job", name):
         return _error_response("NOT_FOUND", "Job not found", 404)
     return _ai_status_payload(name)
 
 
-# Backwards-compat aliases
+# ── Backwards-compat aliases (old method names from Phase-2 prototype) ──
 ai_floor_plan_submit = ai_floor_plan_analyze
 ai_interior_submit = ai_interior_generate
 
@@ -1152,288 +1016,3 @@ def ai_floor_plan_status(job_id=None):
 @frappe.whitelist()
 def ai_interior_status(job_id=None):
     return job_status(job_id=job_id)
-
-
-# ============================================================================
-# AI Design persistence (PR-BE-4)
-# ============================================================================
-
-
-@frappe.whitelist(methods=["POST"])
-def ai_save_design(**kwargs):
-    """Promote a finished AI Job result into a permanent AI Design row.
-
-    Body (JSON or form):
-        job_id           required, must be owned by caller
-        variation_index  0..3, default 0
-        style, room, color, notes - copied from request if not on the job
-    """
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-
-    body = _read_json_body() or {}
-    if not body and frappe.request and frappe.request.form:
-        body = dict(frappe.request.form)
-    job_id = body.get("job_id")
-    if not job_id:
-        return _error_response("MISSING_PARAMS", "job_id is required", 400)
-
-    if not frappe.db.exists("AI Job", job_id):
-        return _error_response("NOT_FOUND", "Job not found", 404)
-
-    job = frappe.get_doc("AI Job", job_id)
-    if job.user != frappe.session.user:
-        return _error_response("FORBIDDEN", "You do not own this job", 403)
-    if job.status != "succeeded":
-        return _error_response("NOT_READY", "Job has not finished successfully", 409)
-
-    result = json.loads(job.result_json or "null") or {}
-    images = result.get("images") or []
-    try:
-        idx = int(body.get("variation_index") or 0)
-    except (TypeError, ValueError):
-        idx = 0
-    if idx < 0 or idx >= len(images):
-        return _error_response("BAD_VARIATION", "variation_index out of range", 400)
-
-    sel = images[idx] if isinstance(images[idx], dict) else {}
-    result_url = sel.get("url")
-    if not result_url:
-        return _error_response("NO_RESULT", "Selected variation has no image URL", 422)
-
-    req_payload = json.loads(job.request_payload_json or "{}")
-
-    design = frappe.new_doc("AI Design")
-    design.user = frappe.session.user
-    design.tool_id = job.job_type
-    design.job_id = job.name
-    design.style = body.get("style") or req_payload.get("style")
-    design.room = body.get("room") or req_payload.get("room")
-    design.color = body.get("color") or req_payload.get("color")
-    design.notes = body.get("notes") or req_payload.get("notes")
-    design.source_file = job.source_image_url
-    design.result_file = result_url
-    design.thumb_file = sel.get("thumb_url")
-    design.params_json = json.dumps({**req_payload, "variation_index": idx})
-    design.model = job.model
-    design.seed = str(sel.get("seed")) if sel.get("seed") is not None else None
-    design.insert(ignore_permissions=True)
-    frappe.db.commit()
-    return {
-        "id": design.name,
-        "result_file": design.result_file,
-        "source_file": design.source_file,
-        "tool_id": design.tool_id,
-        "style": design.style,
-        "room": design.room,
-        "color": design.color,
-        "created_at": str(design.creation),
-    }
-
-
-@frappe.whitelist()
-def list_ai_designs(limit=50, offset=0, tool_id=None):
-    """List saved designs for the authenticated user, newest first."""
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    filters = {"user": frappe.session.user}
-    if tool_id:
-        filters["tool_id"] = tool_id
-    try:
-        limit = max(1, min(200, int(limit)))
-        offset = max(0, int(offset))
-    except (TypeError, ValueError):
-        limit, offset = 50, 0
-    rows = frappe.get_all(
-        "AI Design",
-        filters=filters,
-        fields=["name", "tool_id", "style", "room", "color", "source_file",
-                "result_file", "thumb_file", "model", "creation"],
-        order_by="creation desc",
-        limit_start=offset,
-        limit_page_length=limit,
-    )
-    return {"items": rows, "count": len(rows)}
-
-
-@frappe.whitelist(methods=["POST"])
-def delete_ai_design(id=None, **kwargs):
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    if not id:
-        body = _read_json_body() or {}
-        id = body.get("id")
-    if not id:
-        return _error_response("MISSING_PARAMS", "id is required", 400)
-    if not frappe.db.exists("AI Design", id):
-        return _error_response("NOT_FOUND", "Design not found", 404)
-    design = frappe.get_doc("AI Design", id)
-    if design.user != frappe.session.user:
-        return _error_response("FORBIDDEN", "You do not own this design", 403)
-    frappe.delete_doc("AI Design", id, ignore_permissions=True)
-    frappe.db.commit()
-    return {"deleted": id}
-
-
-@frappe.whitelist()
-def ai_quota_status():
-    """Returns the caller's remaining free generations today + premium status."""
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    from frappe.utils import nowdate
-    user = frappe.session.user
-    premium = ai_cfg.is_premium(user)
-    if premium:
-        return {"premium": True, "remaining_today": -1}
-    key = f"ai_free:{user}:{nowdate()}"
-    used = int(frappe.cache().get_value(key) or 0)
-    cfg = ai_cfg.get_job_config("interior")
-    free_limit = int(cfg.get("free_daily_limit") or 0)
-    remaining = max(0, free_limit - used) if free_limit else -1
-    return {"premium": False, "remaining_today": remaining, "free_daily_limit": free_limit}
-
-
-# ============================================================================
-# Premium subscription (real 7-day free trial; IAP receipt validation hook)
-# ============================================================================
-
-
-@frappe.whitelist()
-def premium_status():
-    """Returns current premium state for the caller."""
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    user = frappe.session.user
-    is_premium = ai_cfg.is_premium(user)
-    expires_at = None
-    source = None
-    trial_used = False
-    settings = ai_cfg.get_settings()
-    for row in (settings.get("premium_users") or []):
-        if row.user != user:
-            continue
-        if (row.note or "") == "trial":
-            trial_used = True
-        if row.expires_at and (expires_at is None or row.expires_at > expires_at):
-            expires_at = row.expires_at
-            source = row.note or "manual"
-    return {
-        "premium": is_premium,
-        "expires_at": str(expires_at) if expires_at else None,
-        "source": source,
-        "trial_used": trial_used,
-    }
-
-
-@frappe.whitelist(methods=["POST"])
-def start_premium_trial(**kwargs):
-    """Grant the caller a 7-day premium trial. Idempotent — re-calling while
-    a trial is already active returns the existing entry; calling after a
-    prior trial expired returns TRIAL_USED."""
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    from datetime import timedelta
-    from frappe.utils import now_datetime
-    user = frappe.session.user
-    settings = frappe.get_doc("AI Settings")
-    now = now_datetime()
-    for row in (settings.get("premium_users") or []):
-        if row.user != user:
-            continue
-        if (row.note or "") != "trial":
-            continue
-        if not row.expires_at or row.expires_at > now:
-            return {
-                "premium": True,
-                "expires_at": str(row.expires_at) if row.expires_at else None,
-                "source": "trial",
-                "trial_used": True,
-                "already_active": True,
-            }
-        return _error_response(
-            "TRIAL_USED",
-            "You've already used your 7-day trial. Subscribe to keep premium features.",
-            409,
-        )
-    expires = now + timedelta(days=7)
-    settings.append("premium_users", {
-        "user": user,
-        "expires_at": expires,
-        "note": "trial",
-    })
-    settings.save(ignore_permissions=True)
-    frappe.db.commit()
-    return {
-        "premium": True,
-        "expires_at": str(expires),
-        "source": "trial",
-        "trial_used": True,
-        "already_active": False,
-    }
-
-
-@frappe.whitelist(methods=["POST"])
-def activate_premium(**kwargs):
-    """Activate or extend premium for the caller from a purchased receipt.
-
-    Body (JSON):
-        platform: "android" | "ios"
-        product_id: e.g. "buildcost_premium_monthly" | "buildcost_premium_annual"
-        receipt:    raw receipt string from Google Play / App Store
-        expires_at: ISO8601 datetime (client estimate; server is authoritative
-                    once real receipt validation is wired)
-
-    For v1 we trust the client's expiry — production-deploy step is to add a
-    Google Play Developer API / App Store Server API verify call here, then
-    overwrite expires_at with the verified value.
-    """
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    body = _read_json_body() or {}
-    expires_raw = body.get("expires_at")
-    product_id = body.get("product_id") or "premium"
-    if not expires_raw:
-        return _error_response("MISSING_PARAMS", "expires_at is required", 400)
-    from frappe.utils import get_datetime, now_datetime
-    try:
-        expires = get_datetime(expires_raw)
-    except Exception:
-        return _error_response("INVALID_DATE", "expires_at must be ISO8601", 400)
-    if expires <= now_datetime():
-        return _error_response("EXPIRED", "expires_at is in the past", 400)
-
-    user = frappe.session.user
-    settings = frappe.get_doc("AI Settings")
-    found = False
-    for row in (settings.get("premium_users") or []):
-        if row.user == user and (row.note or "") == product_id:
-            row.expires_at = expires
-            found = True
-            break
-    if not found:
-        settings.append("premium_users", {
-            "user": user,
-            "expires_at": expires,
-            "note": product_id,
-        })
-    settings.save(ignore_permissions=True)
-    frappe.db.commit()
-    return {
-        "premium": True,
-        "expires_at": str(expires),
-        "source": product_id,
-    }

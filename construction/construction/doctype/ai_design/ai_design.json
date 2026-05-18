@@ -1,0 +1,49 @@
+{
+  "actions": [],
+  "creation": "2026-05-18 00:00:00.000000",
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "naming_rule": "Random",
+  "autoname": "hash",
+  "field_order": [
+    "user",
+    "tool_id",
+    "job_id",
+    "style",
+    "room",
+    "color",
+    "notes",
+    "source_file",
+    "result_file",
+    "thumb_file",
+    "params_json",
+    "model",
+    "seed"
+  ],
+  "fields": [
+    { "fieldname": "user", "fieldtype": "Link", "options": "User", "reqd": 1, "in_list_view": 1, "label": "User" },
+    { "fieldname": "tool_id", "fieldtype": "Data", "reqd": 1, "in_list_view": 1, "label": "Tool ID" },
+    { "fieldname": "job_id", "fieldtype": "Data", "label": "Source AI Job" },
+    { "fieldname": "style", "fieldtype": "Data", "in_list_view": 1, "label": "Style" },
+    { "fieldname": "room", "fieldtype": "Data", "label": "Room" },
+    { "fieldname": "color", "fieldtype": "Data", "label": "Color" },
+    { "fieldname": "notes", "fieldtype": "Small Text", "label": "Notes" },
+    { "fieldname": "source_file", "fieldtype": "Data", "label": "Source file URL" },
+    { "fieldname": "result_file", "fieldtype": "Data", "label": "Result file URL" },
+    { "fieldname": "thumb_file", "fieldtype": "Data", "label": "Thumb file URL" },
+    { "fieldname": "params_json", "fieldtype": "Long Text", "label": "Params JSON" },
+    { "fieldname": "model", "fieldtype": "Data", "label": "Model" },
+    { "fieldname": "seed", "fieldtype": "Data", "label": "Seed" }
+  ],
+  "modified": "2026-05-18 00:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "construction",
+  "name": "AI Design",
+  "owner": "Administrator",
+  "permissions": [
+    { "create": 1, "delete": 1, "export": 1, "read": 1, "report": 1, "role": "System Manager", "share": 1, "write": 1 }
+  ],
+  "sort_field": "creation",
+  "sort_order": "DESC",
+  "track_changes": 1
+}

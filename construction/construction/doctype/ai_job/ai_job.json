@@ -20,13 +20,18 @@
     "tokens_output",
     "cost_cents",
     "started_at",
-    "completed_at"
+    "completed_at",
+    "quality",
+    "variation_count",
+    "source_image_url",
+    "mask_url",
+    "ref_image_url"
   ],
   "fields": [
     {
       "fieldname": "job_type",
       "fieldtype": "Select",
-      "options": "floor_plan\ninterior_design",
+      "options": "floor_plan\ninterior\nexterior\ngarden\nlayout\ncleanup\nref\npaint\nreplace\nfloor",
       "in_list_view": 1,
       "in_standard_filter": 1,
       "label": "Job Type",
@@ -61,7 +66,7 @@
       "fieldname": "request_hash",
       "fieldtype": "Data",
       "label": "Request Hash",
-      "description": "sha256 of canonical request payload — for dedup"
+      "description": "sha256 of canonical request payload \u2014 for dedup"
     },
     {
       "fieldname": "request_payload_json",
@@ -102,8 +107,8 @@
       "fieldname": "cost_cents",
       "fieldtype": "Int",
       "in_list_view": 1,
-      "label": "Cost (¢)",
-      "description": "Cost in USD cents — billing & monitoring"
+      "label": "Cost (\u00a2)",
+      "description": "Cost in USD cents \u2014 billing & monitoring"
     },
     {
       "fieldname": "started_at",
@@ -114,6 +119,34 @@
       "fieldname": "completed_at",
       "fieldtype": "Datetime",
       "label": "Completed At"
+    },
+    {
+      "fieldname": "quality",
+      "fieldtype": "Select",
+      "options": "std\nhd",
+      "default": "std",
+      "label": "Quality"
+    },
+    {
+      "fieldname": "variation_count",
+      "fieldtype": "Int",
+      "default": "1",
+      "label": "Variation count"
+    },
+    {
+      "fieldname": "source_image_url",
+      "fieldtype": "Data",
+      "label": "Source image URL"
+    },
+    {
+      "fieldname": "mask_url",
+      "fieldtype": "Data",
+      "label": "Mask image URL"
+    },
+    {
+      "fieldname": "ref_image_url",
+      "fieldtype": "Data",
+      "label": "Reference image URL"
     }
   ],
   "index_web_pages_for_search": 0,

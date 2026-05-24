@@ -1,0 +1,128 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-05-24 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "user",
+  "event_type",
+  "bucket",
+  "delta",
+  "balance_after",
+  "reason",
+  "ref_doctype",
+  "ref_name",
+  "idempotency_key",
+  "period_month"
+ ],
+ "fields": [
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "options": "User",
+   "label": "User",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "event_type",
+   "fieldtype": "Select",
+   "label": "Event Type",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "reqd": 1,
+   "options": "grant_monthly\ngrant_welcome\ngrant_topup\ndebit_submit\nrefund_failure\nclawback_refund\nadjustment",
+   "description": "Why credits moved. Drives reporting + clawback handling."
+  },
+  {
+   "fieldname": "bucket",
+   "fieldtype": "Select",
+   "label": "Bucket",
+   "reqd": 1,
+   "options": "monthly\ntopup",
+   "description": "Which sub-balance was affected. Monthly resets each period; topup never expires."
+  },
+  {
+   "fieldname": "delta",
+   "fieldtype": "Int",
+   "label": "Delta",
+   "in_list_view": 1,
+   "reqd": 1,
+   "description": "Positive for grants, negative for debits."
+  },
+  {
+   "fieldname": "balance_after",
+   "fieldtype": "Int",
+   "label": "Balance After",
+   "in_list_view": 1,
+   "description": "Snapshot of (monthly + topup) total right after this event for audit."
+  },
+  {
+   "fieldname": "reason",
+   "fieldtype": "Data",
+   "label": "Reason",
+   "length": 200
+  },
+  {
+   "fieldname": "ref_doctype",
+   "fieldtype": "Data",
+   "label": "Ref Doctype",
+   "length": 60,
+   "description": "Doctype this event refers to (e.g. 'AI Job' for debit_submit)."
+  },
+  {
+   "fieldname": "ref_name",
+   "fieldtype": "Data",
+   "label": "Ref Name",
+   "length": 200
+  },
+  {
+   "fieldname": "idempotency_key",
+   "fieldtype": "Data",
+   "label": "Idempotency Key",
+   "length": 80,
+   "unique": 1,
+   "description": "Dedup key \u2014 RTDN webhooks and IAP receipts retry; this stops double-applying."
+  },
+  {
+   "fieldname": "period_month",
+   "fieldtype": "Data",
+   "label": "Period (YYYY-MM)",
+   "length": 7,
+   "in_standard_filter": 1,
+   "description": "For grant_monthly events \u2014 which billing month the grant applies to."
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-05-24 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "construction",
+ "name": "AI Credit Ledger",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "if_owner": 1,
+   "read": 1,
+   "role": "Website User"
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "track_changes": 0
+}

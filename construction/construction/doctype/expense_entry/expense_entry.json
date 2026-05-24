@@ -1,0 +1,141 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-05-23 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "client_id",
+  "user",
+  "project_client_id",
+  "category",
+  "custom_name",
+  "material",
+  "qty",
+  "uom",
+  "amount",
+  "note",
+  "entry_date",
+  "client_created_at",
+  "updated_at",
+  "deleted"
+ ],
+ "fields": [
+  {
+   "fieldname": "client_id",
+   "fieldtype": "Data",
+   "label": "Client ID",
+   "unique": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "options": "User",
+   "label": "User",
+   "in_standard_filter": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "project_client_id",
+   "fieldtype": "Data",
+   "label": "Project (client_id)",
+   "in_standard_filter": 1,
+   "description": "client_id of the parent Expense Project."
+  },
+  {
+   "fieldname": "category",
+   "fieldtype": "Data",
+   "label": "Category",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "custom_name",
+   "fieldtype": "Data",
+   "label": "Custom Name",
+   "description": "Free-text label when category is 'Misc'."
+  },
+  {
+   "fieldname": "material",
+   "fieldtype": "Data",
+   "label": "Material / item",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "qty",
+   "fieldtype": "Float",
+   "label": "Quantity"
+  },
+  {
+   "fieldname": "uom",
+   "fieldtype": "Data",
+   "label": "Unit of Measure"
+  },
+  {
+   "fieldname": "amount",
+   "fieldtype": "Currency",
+   "label": "Amount",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "note",
+   "fieldtype": "Small Text",
+   "label": "Note"
+  },
+  {
+   "fieldname": "entry_date",
+   "fieldtype": "Date",
+   "label": "Date"
+  },
+  {
+   "fieldname": "client_created_at",
+   "fieldtype": "Datetime",
+   "label": "Created (device)"
+  },
+  {
+   "fieldname": "updated_at",
+   "fieldtype": "Datetime",
+   "label": "Updated At",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "deleted",
+   "fieldtype": "Check",
+   "label": "Deleted (tombstone)",
+   "default": "0"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-05-23 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "construction",
+ "name": "Expense Entry",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "if_owner": 1,
+   "read": 1,
+   "role": "Website User",
+   "write": 1
+  }
+ ],
+ "sort_field": "updated_at",
+ "sort_order": "DESC",
+ "track_changes": 0
+}

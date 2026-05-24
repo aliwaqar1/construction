@@ -72,6 +72,25 @@ def run_job(name):
     doc.save(ignore_permissions=True)
     frappe.db.commit()
 
+    # PREM-4: failed jobs auto-refund the credits that were debited at submit
+    # time. Idempotent: _refund_credits keys on the original (ref_doctype,
+    # ref_name) pair so re-running this is safe.
+    if doc.status == "failed":
+        try:
+            from construction.api.v1 import _refund_credits, _credit_gating_enabled
+            if _credit_gating_enabled():
+                _refund_credits(
+                    doc.user,
+                    ref_doctype="AI Job",
+                    ref_name=doc.name,
+                    reason=f"AI job failed: {doc.error_code or 'unknown'}",
+                )
+                frappe.db.commit()
+        except Exception:
+            frappe.log_error(
+                traceback.format_exc(), f"ai_worker.refund_failed:{name}"
+            )
+
 
 class _AIDisabled(Exception):
     pass

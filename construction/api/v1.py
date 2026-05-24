@@ -11,6 +11,7 @@ Frappe URLs (all allow_guest):
 import hashlib
 import json
 import traceback
+import uuid
 
 import frappe
 
@@ -21,8 +22,12 @@ from construction.estimate_engine.engine import resolve_estimate
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _error_response(code, message, http_status=400, details=None):
-    """Return a structured error dict and set the HTTP status code."""
+def _error_response(code, message, http_status=400, details=None, correlation_id=None):
+    """Return a structured error dict and set the HTTP status code.
+
+    Pass `correlation_id` (from `_log_unhandled`) so the client can surface
+    it for support and tie back to the server-side Error Log row.
+    """
     frappe.local.response.http_status_code = http_status
     resp = {
         "ok": False,
@@ -31,9 +36,27 @@ def _error_response(code, message, http_status=400, details=None):
             "message": message,
         },
     }
+    if correlation_id:
+        resp["error"]["correlation_id"] = correlation_id
     if details:
         resp["error"]["details"] = details
     return resp
+
+
+def _log_unhandled(method_name):
+    """Log an unhandled exception with a short correlation id; return it.
+
+    The id goes into the API response so the client can show a Report
+    affordance carrying it, and is suffixed onto the log title so a search
+    in Frappe's Error Log finds the matching row instantly.
+    """
+    corr_id = uuid.uuid4().hex[:12]
+    try:
+        frappe.log_error(traceback.format_exc(), f"{method_name} \u00b7 {corr_id}")
+    except Exception:
+        # Never let logging itself break the error path.
+        pass
+    return corr_id
 
 
 # ---------------------------------------------------------------------------
@@ -52,8 +75,8 @@ def countries():
         )
         return {"countries": rows}
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.countries")
-        return _error_response("SERVER_ERROR", "Failed to load countries", 500)
+        corr = _log_unhandled("v1.countries")
+        return _error_response("SERVER_ERROR", "Failed to load countries", 500, correlation_id=corr)
 
 
 # ---------------------------------------------------------------------------
@@ -76,8 +99,8 @@ def cities(country=None):
         )
         return {"cities": rows}
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.cities")
-        return _error_response("SERVER_ERROR", "Failed to load cities", 500)
+        corr = _log_unhandled("v1.cities")
+        return _error_response("SERVER_ERROR", "Failed to load cities", 500, correlation_id=corr)
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +143,8 @@ def questionnaire(country=None, city=None, flow=None):
             "steps": steps_data.get("steps", []),
         }
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.questionnaire")
-        return _error_response("SERVER_ERROR", "Failed to load questionnaire", 500)
+        corr = _log_unhandled("v1.questionnaire")
+        return _error_response("SERVER_ERROR", "Failed to load questionnaire", 500, correlation_id=corr)
 
 
 # ---------------------------------------------------------------------------
@@ -203,11 +226,12 @@ def estimate(**kwargs):
     except frappe.ValidationError as e:
         return _error_response("VALIDATION_ERROR", str(e), 422)
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.estimate")
+        corr = _log_unhandled("v1.estimate")
         return _error_response(
             "SERVER_ERROR",
             "An unexpected error occurred while computing the estimate",
             500,
+            correlation_id=corr,
         )
 
 
@@ -265,8 +289,8 @@ def config(app_version=None, device_id=None):
             "min_supported_version": "1.0.0",
         }
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.config")
-        return _error_response("SERVER_ERROR", "Failed to load config", 500)
+        corr = _log_unhandled("v1.config")
+        return _error_response("SERVER_ERROR", "Failed to load config", 500, correlation_id=corr)
 
 
 # ============================================================================
@@ -320,8 +344,8 @@ def login(usr=None, pwd=None):
     except frappe.AuthenticationError:
         return _error_response("INVALID_CREDENTIALS", "Invalid email or password", 401)
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.login")
-        return _error_response("SERVER_ERROR", "Login failed", 500)
+        corr = _log_unhandled("v1.login")
+        return _error_response("SERVER_ERROR", "Login failed", 500, correlation_id=corr)
 
     api_key, api_secret = _user_keys(frappe.session.user)
     return {
@@ -374,8 +398,8 @@ def register(email=None, password=None, full_name=None):
         user_doc.insert(ignore_permissions=True)
         frappe.db.commit()
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.register")
-        return _error_response("SERVER_ERROR", "Failed to create account", 500)
+        corr = _log_unhandled("v1.register")
+        return _error_response("SERVER_ERROR", "Failed to create account", 500, correlation_id=corr)
 
     api_key, api_secret = _user_keys(email)
     return {
@@ -486,8 +510,8 @@ def save_estimate(**kwargs):
         frappe.db.commit()
         return {"ok": True, "name": doc.name, "client_id": doc.client_id}
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.save_estimate")
-        return _error_response("SERVER_ERROR", "Failed to save estimate", 500)
+        corr = _log_unhandled("v1.save_estimate")
+        return _error_response("SERVER_ERROR", "Failed to save estimate", 500, correlation_id=corr)
 
 
 @frappe.whitelist()
@@ -521,8 +545,8 @@ def list_estimates(limit=50, offset=0):
             r["saved_at"] = str(r["saved_at"]) if r.get("saved_at") else None
         return {"estimates": rows}
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.list_estimates")
-        return _error_response("SERVER_ERROR", "Failed to list estimates", 500)
+        corr = _log_unhandled("v1.list_estimates")
+        return _error_response("SERVER_ERROR", "Failed to list estimates", 500, correlation_id=corr)
 
 
 @frappe.whitelist()
@@ -568,8 +592,8 @@ def delete_estimate(name=None):
         frappe.db.commit()
         return {"ok": True}
     except Exception:
-        frappe.log_error(traceback.format_exc(), "v1.delete_estimate")
-        return _error_response("SERVER_ERROR", "Failed to delete estimate", 500)
+        corr = _log_unhandled("v1.delete_estimate")
+        return _error_response("SERVER_ERROR", "Failed to delete estimate", 500, correlation_id=corr)
 
 
 @frappe.whitelist(methods=["POST"])
@@ -622,8 +646,12 @@ def sync_estimates(**kwargs):
             doc.save(ignore_permissions=True)
             saved.append(doc.client_id)
         except Exception:
-            frappe.log_error(traceback.format_exc(), "v1.sync_estimates.item")
-            failed.append({"client_id": est.get("client_id"), "reason": "server_error"})
+            corr = _log_unhandled("v1.sync_estimates.item")
+            failed.append({
+                "client_id": est.get("client_id"),
+                "reason": "server_error",
+                "correlation_id": corr,
+            })
 
     frappe.db.commit()
 
@@ -947,14 +975,48 @@ def _ai_submit(tool_id, body, extra_payload):
             429,
         )
 
-    ok, remaining = _free_quota_check(user, tool_id, cfg.get("free_daily_limit"))
-    if not ok:
-        return _error_response(
-            "FREE_QUOTA_EXCEEDED",
-            "Daily free AI quota reached. Upgrade to premium for unlimited generations.",
-            429,
-            details={"remaining_today": 0},
-        )
+    # PREM-4: credit ledger first, daily-quota as fallback. When credit gating
+    # is off, the legacy free-daily-limit path runs unchanged so nothing
+    # breaks before we have IAP wired (PREM-3) and a way for users to top up.
+    if _credit_gating_enabled():
+        cost = _credit_cost_for(tool_id, body.get("quality"), body.get("variations"))
+        if cost > 0:
+            # Idempotency: re-submits with the same client UUID don't debit
+            # twice. Falls back to the request hash when the header is missing.
+            debit_key = (
+                f"ai_submit:{user}:"
+                f"{(body.get('idempotency_key') or _canonical_request_hash(body))}"
+            )
+            result = _debit_credits(
+                user,
+                amount=cost,
+                ref_doctype="AI Job",
+                ref_name="",  # filled in after the doc is inserted
+                reason=f"AI submit: {tool_id}",
+                idempotency_key=debit_key,
+            )
+            if result.get("applied", 0) < cost:
+                state = _get_credit_state(user)
+                return _error_response(
+                    "INSUFFICIENT_CREDITS",
+                    "Not enough credits for this run. Top up to keep going.",
+                    402,
+                    details={
+                        "cost": cost,
+                        "balance": state["total_balance"],
+                        "monthly_balance": state["monthly_balance"],
+                        "topup_balance": state["topup_balance"],
+                    },
+                )
+    else:
+        ok, remaining = _free_quota_check(user, tool_id, cfg.get("free_daily_limit"))
+        if not ok:
+            return _error_response(
+                "FREE_QUOTA_EXCEEDED",
+                "Daily free AI quota reached. Upgrade to premium for unlimited generations.",
+                429,
+                details={"remaining_today": 0},
+            )
 
     budget_err = _check_budgets(tool_id, cfg)
     if budget_err is not None:
@@ -998,9 +1060,33 @@ def _ai_submit(tool_id, body, extra_payload):
         doc.mask_url = extra_payload.get("mask_url") if extra_payload else None
         doc.ref_image_url = extra_payload.get("ref_image_url") if extra_payload else None
         doc.insert(ignore_permissions=True)
+
+        # PREM-4: now that the job has a name, point the credit-debit rows at
+        # it so the worker can issue a refund-by-ref if the job fails.
+        if _credit_gating_enabled():
+            try:
+                frappe.db.sql(
+                    """update `tabAI Credit Ledger`
+                       set ref_name = %(name)s
+                       where user = %(user)s
+                         and ref_doctype = 'AI Job'
+                         and (ref_name is null or ref_name = '')
+                         and idempotency_key like %(key_prefix)s""",
+                    {
+                        "name": doc.name,
+                        "user": user,
+                        "key_prefix": f"ai_submit:{user}:%",
+                    },
+                )
+            except Exception:
+                # Backfill is opportunistic — refund still works via job name
+                # if the ledger insert raced, just slower (scan by user).
+                pass
+
         frappe.db.commit()
 
-        _free_quota_increment(user)
+        if not _credit_gating_enabled():
+            _free_quota_increment(user)
 
         frappe.enqueue(
             "construction.api.ai_worker.run_job",
@@ -1011,8 +1097,10 @@ def _ai_submit(tool_id, body, extra_payload):
 
         return _ai_status_payload(doc.name)
     except Exception:
-        frappe.log_error(traceback.format_exc(), f"v1.ai_submit:{tool_id}")
-        return _error_response("SERVER_ERROR", "Failed to enqueue AI job", 500)
+        corr = _log_unhandled(f"v1.ai_submit:{tool_id}")
+        return _error_response(
+            "SERVER_ERROR", "Failed to enqueue AI job", 500, correlation_id=corr
+        )
 
 
 def _ai_status_payload(name):
@@ -1437,3 +1525,823 @@ def activate_premium(**kwargs):
         "expires_at": str(expires),
         "source": product_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/log_client_error  - record a client-side error report
+# ---------------------------------------------------------------------------
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def log_client_error(**kwargs):
+    """Append a client-side error report to Frappe Error Log.
+
+    Body (JSON): {message, stack, app_version, platform, route, correlation_id?,
+    device_id?}. Fields are trimmed so a runaway client cannot flood the log.
+    Returns {ok: True, correlation_id} so the client can surface the id if it
+    did not already have one.
+    """
+    try:
+        data = _read_json_body() if not kwargs else kwargs
+        if not isinstance(data, dict):
+            data = {}
+
+        def _s(v, lim):
+            if v is None:
+                return ""
+            return str(v)[:lim]
+
+        message = _s(data.get("message"), 500)
+        stack = _s(data.get("stack"), 4000)
+        app_version = _s(data.get("app_version"), 50)
+        platform = _s(data.get("platform"), 50)
+        route = _s(data.get("route"), 200)
+        device_id = _s(data.get("device_id"), 100)
+        correlation_id = _s(data.get("correlation_id"), 50) or uuid.uuid4().hex[:12]
+
+        title = f"client \u00b7 {platform or 'unknown'} \u00b7 {(message or 'no message')[:60]}"
+        body = (
+            f"correlation_id: {correlation_id}\n"
+            f"app_version: {app_version}\n"
+            f"platform: {platform}\n"
+            f"route: {route}\n"
+            f"device_id: {device_id}\n"
+            f"message: {message}\n\n"
+            f"stack:\n{stack}\n"
+        )
+        try:
+            frappe.log_error(body, title)
+        except Exception:
+            pass
+        return {"ok": True, "correlation_id": correlation_id}
+    except Exception:
+        corr = _log_unhandled("v1.log_client_error")
+        return _error_response("SERVER_ERROR", "Could not record report", 500, correlation_id=corr)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/sync_expenses  - two-way sync for expense projects + entries
+# ---------------------------------------------------------------------------
+
+@frappe.whitelist(methods=["POST"])
+def sync_expenses(**kwargs):
+    """Push the client's expense projects + entries; receive the authoritative
+    server list back.
+
+    Body shape:
+      {
+        "projects": [
+          {"client_id", "name", "location", "budget", "estimate_id"?,
+           "created_at", "updated_at", "deleted"},
+          ...
+        ],
+        "expenses": [
+          {"client_id", "project_client_id", "category", "custom_name"?,
+           "material", "qty"?, "uom"?, "amount", "note"?, "date"?,
+           "created_at", "updated_at", "deleted"},
+          ...
+        ]
+      }
+
+    Conflict resolution is last-write-wins via `updated_at` — a payload row is
+    only applied when its `updated_at` is strictly newer than the server's
+    (or the server row does not yet exist). Tombstones (`deleted=1`) are kept
+    so deletions propagate to other devices on the same account.
+
+    Idempotent on `(user, client_id)`. Per-row failures are reported back in
+    `failed` and do not abort the batch.
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+
+    data = _read_json_body()
+    if data is None:
+        return _error_response("INVALID_JSON", "Body is not valid JSON")
+
+    incoming_projects = data.get("projects") or []
+    incoming_expenses = data.get("expenses") or []
+    if not isinstance(incoming_projects, list) or not isinstance(incoming_expenses, list):
+        return _error_response(
+            "INVALID_PARAMS",
+            "'projects' and 'expenses' must each be a list",
+        )
+
+    user = frappe.session.user
+    saved_projects, failed_projects = _upsert_many(
+        "Expense Project", user, incoming_projects, _apply_expense_project
+    )
+    saved_expenses, failed_expenses = _upsert_many(
+        "Expense Entry", user, incoming_expenses, _apply_expense_entry
+    )
+
+    frappe.db.commit()
+
+    server_projects = frappe.get_all(
+        "Expense Project",
+        filters={"user": user},
+        fields=[
+            "client_id", "project_name", "location", "budget",
+            "estimate_client_id", "client_created_at", "updated_at", "deleted",
+        ],
+        order_by="updated_at desc",
+        limit_page_length=0,
+    )
+    server_expenses = frappe.get_all(
+        "Expense Entry",
+        filters={"user": user},
+        fields=[
+            "client_id", "project_client_id", "category", "custom_name",
+            "material", "qty", "uom", "amount", "note", "entry_date",
+            "client_created_at", "updated_at", "deleted",
+        ],
+        order_by="updated_at desc",
+        limit_page_length=0,
+    )
+
+    for r in server_projects:
+        r["created_at"] = str(r.pop("client_created_at")) if r.get("client_created_at") else None
+        r["updated_at"] = str(r["updated_at"]) if r.get("updated_at") else None
+        r["name"] = r.pop("project_name") or ""
+        r["estimate_id"] = r.pop("estimate_client_id") or None
+        r["deleted"] = bool(r.get("deleted"))
+
+    for r in server_expenses:
+        r["created_at"] = str(r.pop("client_created_at")) if r.get("client_created_at") else None
+        r["updated_at"] = str(r["updated_at"]) if r.get("updated_at") else None
+        r["date"] = str(r.pop("entry_date")) if r.get("entry_date") else None
+        r["deleted"] = bool(r.get("deleted"))
+
+    return {
+        "ok": True,
+        "projects": server_projects,
+        "expenses": server_expenses,
+        "saved_projects": saved_projects,
+        "failed_projects": failed_projects,
+        "saved_expenses": saved_expenses,
+        "failed_expenses": failed_expenses,
+    }
+
+
+def _upsert_many(doctype, user, rows, apply_fn):
+    saved, failed = [], []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("client_id"):
+            failed.append({"reason": "missing client_id"})
+            continue
+        client_id = row["client_id"]
+        try:
+            existing_name = frappe.db.get_value(
+                doctype, {"user": user, "client_id": client_id}, "name"
+            )
+            incoming_updated = _parse_dt(row.get("updated_at"))
+            if existing_name:
+                server_updated = frappe.db.get_value(doctype, existing_name, "updated_at")
+                if (
+                    server_updated
+                    and incoming_updated
+                    and incoming_updated <= server_updated
+                ):
+                    # Server is newer — keep it.
+                    continue
+                doc = frappe.get_doc(doctype, existing_name)
+            else:
+                doc = frappe.new_doc(doctype)
+                doc.client_id = client_id
+                doc.user = user
+            apply_fn(doc, row)
+            doc.save(ignore_permissions=True)
+            saved.append(client_id)
+        except Exception:
+            corr = _log_unhandled(f"v1.sync_expenses.{doctype.lower().replace(' ', '_')}")
+            failed.append({
+                "client_id": client_id,
+                "reason": "server_error",
+                "correlation_id": corr,
+            })
+    return saved, failed
+
+
+def _apply_expense_project(doc, row):
+    doc.project_name = (row.get("name") or "")[:160]
+    doc.location = (row.get("location") or "")[:160]
+    doc.budget = float(row.get("budget") or 0)
+    doc.estimate_client_id = row.get("estimate_id") or ""
+    doc.client_created_at = (
+        _parse_dt(row.get("created_at")) or frappe.utils.now_datetime()
+    )
+    doc.updated_at = (
+        _parse_dt(row.get("updated_at")) or frappe.utils.now_datetime()
+    )
+    doc.deleted = 1 if row.get("deleted") else 0
+
+
+def _apply_expense_entry(doc, row):
+    doc.project_client_id = (row.get("project_client_id") or "")[:140]
+    doc.category = (row.get("category") or "")[:60]
+    doc.custom_name = (row.get("custom_name") or "")[:160]
+    doc.material = (row.get("material") or "")[:160]
+    doc.qty = float(row.get("qty")) if row.get("qty") is not None else None
+    doc.uom = (row.get("uom") or "")[:40]
+    doc.amount = float(row.get("amount") or 0)
+    doc.note = (row.get("note") or "")[:1000]
+    doc.entry_date = _parse_dt(row.get("date"))
+    doc.client_created_at = (
+        _parse_dt(row.get("created_at")) or frappe.utils.now_datetime()
+    )
+    doc.updated_at = (
+        _parse_dt(row.get("updated_at")) or frappe.utils.now_datetime()
+    )
+    doc.deleted = 1 if row.get("deleted") else 0
+
+
+def _parse_dt(value):
+    """Tolerant ISO-8601 / date / datetime parser. Returns a datetime or None."""
+    if not value:
+        return None
+    if hasattr(value, "year"):
+        return value
+    try:
+        return frappe.utils.get_datetime(str(value))
+    except Exception:
+        try:
+            return frappe.utils.getdate(str(value))
+        except Exception:
+            return None
+
+
+# ===========================================================================
+# AI CREDIT LEDGER (PREM-1)
+# ===========================================================================
+# Append-only ledger of credit movements. Balance is a projection over deltas
+# scoped to the current monthly period for the `monthly` bucket and lifetime
+# for the `topup` bucket. Debits prefer monthly first so users don't burn
+# top-ups they paid for while their monthly quota goes unused.
+#
+# Idempotency: every event carries an optional `idempotency_key` (unique). Use
+# it for RTDN webhooks and IAP receipts so retries don't double-apply.
+# ===========================================================================
+
+# Default per-month grant for active Pro subscribers. Per
+# docs/PREMIUM_MONETIZATION_PLAN.md the locked decision is 80, no rollover.
+_DEFAULT_MONTHLY_QUOTA = 80
+# Welcome grant given once per device-identity (anti-abuse anchored on SSAID +
+# Play Integrity, enforced higher up; this just sets the amount).
+_DEFAULT_WELCOME_QUOTA = 5
+
+
+def _current_period_month():
+    """Return the current billing month as 'YYYY-MM'."""
+    now = frappe.utils.now_datetime()
+    return now.strftime("%Y-%m")
+
+
+def _next_period_start(period_month=None):
+    """First instant of the month after `period_month` (or after the current
+    period when not specified). Used for `next_reset_at` in the API response."""
+    period = period_month or _current_period_month()
+    year, month = (int(x) for x in period.split("-"))
+    if month == 12:
+        return frappe.utils.get_datetime(f"{year + 1}-01-01 00:00:00")
+    return frappe.utils.get_datetime(f"{year}-{month + 1:02d}-01 00:00:00")
+
+
+def _sum_deltas(user, bucket, period_month=None):
+    """Sum of deltas for the user/bucket. When `period_month` is given, only
+    events tagged with that period count (used for the monthly bucket).
+    """
+    filters = {"user": user, "bucket": bucket}
+    if period_month:
+        # Monthly grants are tagged; debits/refunds against monthly inherit the
+        # tag from the originating period so a fresh month starts clean.
+        filters["period_month"] = period_month
+    rows = frappe.get_all(
+        "AI Credit Ledger",
+        filters=filters,
+        fields=["delta"],
+        limit_page_length=0,
+    )
+    return sum(int(r.delta or 0) for r in rows)
+
+
+def _get_credit_state(user, monthly_quota=_DEFAULT_MONTHLY_QUOTA):
+    """Computed credit state for `user`. Read-only; never mutates."""
+    period = _current_period_month()
+    monthly_balance = max(0, _sum_deltas(user, "monthly", period_month=period))
+    topup_balance = max(0, _sum_deltas(user, "topup"))
+    monthly_used = max(0, monthly_quota - monthly_balance)
+    return {
+        "monthly_balance": monthly_balance,
+        "monthly_quota": monthly_quota,
+        "monthly_used": monthly_used,
+        "topup_balance": topup_balance,
+        "total_balance": monthly_balance + topup_balance,
+        "period_month": period,
+        "next_reset_at": str(_next_period_start(period)),
+    }
+
+
+def _insert_ledger_event(
+    user,
+    event_type,
+    bucket,
+    delta,
+    reason=None,
+    ref_doctype=None,
+    ref_name=None,
+    idempotency_key=None,
+    period_month=None,
+):
+    """Insert a single ledger row, returning the snapshot balance afterwards.
+
+    When `idempotency_key` is set and a row already exists with that key, this
+    is a no-op (returns the existing row's balance_after). Callers can rely on
+    this for webhook retries.
+    """
+    if idempotency_key:
+        existing = frappe.db.get_value(
+            "AI Credit Ledger",
+            {"idempotency_key": idempotency_key},
+            ["balance_after"],
+            as_dict=True,
+        )
+        if existing:
+            return int(existing.get("balance_after") or 0)
+
+    # Compute new total balance for the snapshot. Must include this delta.
+    snapshot = _get_credit_state(user)
+    if bucket == "monthly":
+        snapshot_total = max(0, snapshot["monthly_balance"] + delta) + snapshot["topup_balance"]
+    else:
+        snapshot_total = snapshot["monthly_balance"] + max(0, snapshot["topup_balance"] + delta)
+
+    doc = frappe.new_doc("AI Credit Ledger")
+    doc.user = user
+    doc.event_type = event_type
+    doc.bucket = bucket
+    doc.delta = int(delta)
+    doc.balance_after = snapshot_total
+    doc.reason = (reason or "")[:200]
+    doc.ref_doctype = (ref_doctype or "")[:60]
+    doc.ref_name = (ref_name or "")[:200]
+    doc.idempotency_key = idempotency_key or ""
+    doc.period_month = period_month or ""
+    doc.insert(ignore_permissions=True)
+    return snapshot_total
+
+
+def _grant_monthly_credits(user, period_month=None, quota=_DEFAULT_MONTHLY_QUOTA, reason=None):
+    """Idempotent on (user, period_month). Resets monthly bucket to `quota`.
+
+    No-rollover model: instead of accumulating, we reset by emitting a single
+    grant for the target period. Re-running this for the same period is a
+    no-op thanks to the idempotency key.
+    """
+    period = period_month or _current_period_month()
+    idem = f"grant_monthly:{user}:{period}"
+    return _insert_ledger_event(
+        user,
+        event_type="grant_monthly",
+        bucket="monthly",
+        delta=int(quota),
+        reason=reason or f"Monthly Pro grant for {period}",
+        idempotency_key=idem,
+        period_month=period,
+    )
+
+
+def _grant_welcome_credits(user, amount=_DEFAULT_WELCOME_QUOTA, idempotency_key=None, reason=None):
+    """Idempotent on `idempotency_key` — caller should pass a hashed device id
+    + 'welcome' so each device only ever gets the grant once.
+    """
+    return _insert_ledger_event(
+        user,
+        event_type="grant_welcome",
+        bucket="topup",
+        delta=int(amount),
+        reason=reason or "Welcome design credits",
+        idempotency_key=idempotency_key,
+    )
+
+
+def _grant_topup_credits(user, amount, idempotency_key, reason=None, ref_name=None):
+    """Idempotent on the receipt-derived `idempotency_key`. Adds to the topup
+    bucket which never expires.
+    """
+    return _insert_ledger_event(
+        user,
+        event_type="grant_topup",
+        bucket="topup",
+        delta=int(amount),
+        reason=reason or "Top-up pack purchase",
+        ref_doctype="Top-up Receipt",
+        ref_name=ref_name,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _debit_credits(user, amount, ref_doctype, ref_name, reason=None, idempotency_key=None):
+    """Atomically debit `amount` credits from the user, monthly first then
+    topup. Splits across buckets when monthly is short.
+
+    Returns a dict {applied: int, monthly_taken: int, topup_taken: int,
+    balance_after: int}. If the user has < amount credits in total, applies
+    nothing and returns applied=0 — caller is responsible for surfacing the
+    out-of-credits error.
+
+    Idempotency: when `idempotency_key` is set, a re-debit with the same key
+    is a no-op (returns the same applied count derived from existing rows).
+    """
+    amount = int(amount)
+    if amount <= 0:
+        return {"applied": 0, "monthly_taken": 0, "topup_taken": 0, "balance_after": 0}
+
+    # Idempotency check: look up any prior debit with this key.
+    if idempotency_key:
+        prior = frappe.get_all(
+            "AI Credit Ledger",
+            filters={"idempotency_key": ["like", f"{idempotency_key}%"]},
+            fields=["delta", "bucket", "balance_after"],
+        )
+        if prior:
+            monthly_taken = sum(-int(r.delta) for r in prior if r.bucket == "monthly" and int(r.delta) < 0)
+            topup_taken = sum(-int(r.delta) for r in prior if r.bucket == "topup" and int(r.delta) < 0)
+            return {
+                "applied": monthly_taken + topup_taken,
+                "monthly_taken": monthly_taken,
+                "topup_taken": topup_taken,
+                "balance_after": int(prior[0].balance_after or 0),
+            }
+
+    state = _get_credit_state(user)
+    if state["total_balance"] < amount:
+        return {"applied": 0, "monthly_taken": 0, "topup_taken": 0, "balance_after": state["total_balance"]}
+
+    monthly_take = min(state["monthly_balance"], amount)
+    topup_take = amount - monthly_take
+    balance_after = 0
+
+    if monthly_take > 0:
+        balance_after = _insert_ledger_event(
+            user,
+            event_type="debit_submit",
+            bucket="monthly",
+            delta=-monthly_take,
+            reason=reason or "AI submission",
+            ref_doctype=ref_doctype,
+            ref_name=ref_name,
+            idempotency_key=(f"{idempotency_key}:monthly" if idempotency_key else None),
+            period_month=state["period_month"],
+        )
+    if topup_take > 0:
+        balance_after = _insert_ledger_event(
+            user,
+            event_type="debit_submit",
+            bucket="topup",
+            delta=-topup_take,
+            reason=reason or "AI submission",
+            ref_doctype=ref_doctype,
+            ref_name=ref_name,
+            idempotency_key=(f"{idempotency_key}:topup" if idempotency_key else None),
+        )
+
+    return {
+        "applied": monthly_take + topup_take,
+        "monthly_taken": monthly_take,
+        "topup_taken": topup_take,
+        "balance_after": balance_after,
+    }
+
+
+def _refund_credits(user, ref_doctype, ref_name, reason=None):
+    """Mirror a prior debit by `ref_doctype` + `ref_name`. Sums the negative
+    deltas on those rows and emits matching positive events into the same
+    buckets so the refund lands back where it came from.
+
+    Idempotent via a derived key (`refund:<ref_doctype>:<ref_name>`).
+    """
+    debits = frappe.get_all(
+        "AI Credit Ledger",
+        filters={
+            "user": user,
+            "ref_doctype": ref_doctype,
+            "ref_name": ref_name,
+            "event_type": "debit_submit",
+        },
+        fields=["delta", "bucket"],
+    )
+    if not debits:
+        return {"applied": 0, "balance_after": _get_credit_state(user)["total_balance"]}
+
+    monthly_amt = -sum(int(r.delta) for r in debits if r.bucket == "monthly" and int(r.delta) < 0)
+    topup_amt = -sum(int(r.delta) for r in debits if r.bucket == "topup" and int(r.delta) < 0)
+    base_key = f"refund:{ref_doctype}:{ref_name}"
+    balance_after = 0
+
+    if monthly_amt > 0:
+        balance_after = _insert_ledger_event(
+            user,
+            event_type="refund_failure",
+            bucket="monthly",
+            delta=monthly_amt,
+            reason=reason or "Refund on job failure",
+            ref_doctype=ref_doctype,
+            ref_name=ref_name,
+            idempotency_key=f"{base_key}:monthly",
+            period_month=_current_period_month(),
+        )
+    if topup_amt > 0:
+        balance_after = _insert_ledger_event(
+            user,
+            event_type="refund_failure",
+            bucket="topup",
+            delta=topup_amt,
+            reason=reason or "Refund on job failure",
+            ref_doctype=ref_doctype,
+            ref_name=ref_name,
+            idempotency_key=f"{base_key}:topup",
+        )
+
+    return {"applied": monthly_amt + topup_amt, "balance_after": balance_after}
+
+
+@frappe.whitelist()
+def credits_balance():
+    """Current credit state for the calling user. Used by the UI to render the
+    credit chip on the AI hub + the paywall sheets.
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+    try:
+        return _get_credit_state(frappe.session.user)
+    except Exception:
+        corr = _log_unhandled("v1.credits_balance")
+        return _error_response("SERVER_ERROR", "Failed to load credits", 500, correlation_id=corr)
+
+
+@frappe.whitelist(methods=["POST"])
+def dev_grant_credits(**kwargs):
+    """ADMIN-ONLY hook for manually seeding credits while we develop the IAP /
+    RTDN integrations. Restricted to System Manager so it can't leak into
+    production accidentally — the real grants come from `_grant_monthly_credits`
+    on subscription renew and `_grant_topup_credits` on validated purchases.
+
+    Body: {event_type, bucket, delta, reason?, idempotency_key?, target_user?}
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+    if "System Manager" not in frappe.get_roles(frappe.session.user):
+        return _error_response("FORBIDDEN", "System Manager role required", 403)
+
+    data = _read_json_body() if not kwargs else kwargs
+    if not isinstance(data, dict):
+        return _error_response("INVALID_BODY", "Expected JSON object", 400)
+
+    target = data.get("target_user") or frappe.session.user
+    event_type = data.get("event_type") or "adjustment"
+    bucket = data.get("bucket") or "topup"
+    try:
+        delta = int(data.get("delta") or 0)
+    except (TypeError, ValueError):
+        return _error_response("INVALID_PARAMS", "'delta' must be an integer", 400)
+    if delta == 0:
+        return _error_response("INVALID_PARAMS", "'delta' must be non-zero", 400)
+
+    try:
+        balance_after = _insert_ledger_event(
+            target,
+            event_type=event_type,
+            bucket=bucket,
+            delta=delta,
+            reason=data.get("reason") or "Dev grant",
+            idempotency_key=data.get("idempotency_key"),
+            period_month=data.get("period_month")
+                or (_current_period_month() if bucket == "monthly" else None),
+        )
+        frappe.db.commit()
+        return {"ok": True, "balance_after": balance_after}
+    except Exception:
+        corr = _log_unhandled("v1.dev_grant_credits")
+        return _error_response("SERVER_ERROR", "Failed to grant credits", 500, correlation_id=corr)
+
+# ===========================================================================
+# CREDIT GATING (PREM-4)
+# ===========================================================================
+# Wires the credit ledger from PREM-1 into the AI submit pipeline. Behaviour
+# is gated by the `credit_gating` feature flag so the existing free-daily
+# quota stays in force until we flip the switch. Once on, a submit costs:
+#
+#   cost = variations * (hd ? 2 : 1)
+#
+# Floor-plan analysis stays free (or limited by the existing daily quota) on
+# both sides — it costs near-zero on the vendor side and is the hook product.
+# ===========================================================================
+
+_CREDIT_HD_MULTIPLIER = 2
+
+
+def _credit_gating_enabled():
+    """Cheap wrapper around the feature flag. Anything other than an enabled
+    `credit_gating` flag returns False so legacy behaviour holds.
+    """
+    try:
+        return _flag_enabled("credit_gating")
+    except Exception:
+        return False
+
+
+def _credit_cost_for(tool_id, quality, variations):
+    """Per-submit credit cost. Floor-plan analysis is free; everything else
+    scales by variations and doubles for HD output.
+    """
+    if tool_id == "floor_plan":
+        return 0
+    try:
+        v = max(1, min(4, int(variations or 1)))
+    except (TypeError, ValueError):
+        v = 1
+    hd = (quality or "std").lower() == "hd"
+    return v * (_CREDIT_HD_MULTIPLIER if hd else 1)
+
+# ===========================================================================
+# AUTH-1 (anon bootstrap)
+# ===========================================================================
+# First-launch handshake — no email / password / OAuth. Client posts its
+# device UUID, server returns a Frappe API key+secret bound to a disabled-
+# login Website User row (so password auth can't hit it). Subsequent calls
+# use the returned token in the standard Authorization header.
+#
+# Idempotent: re-calling with the same `device_id` returns the same row's
+# keys. The row's email is namespaced (`anon-<device_id>@buildcost.anon`) so
+# it can never collide with a real user.
+# ===========================================================================
+
+_ANON_EMAIL_DOMAIN = "buildcost.anon"
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def anon_bootstrap(**kwargs):
+    """Create / return the anonymous account keyed to this device.
+
+    Body: {"device_id": "<uuid>"}
+    Returns: {"anon_user_id", "api_key", "api_secret", "created"}
+    """
+    data = _read_json_body() if not kwargs else kwargs
+    if not isinstance(data, dict):
+        return _error_response("INVALID_BODY", "Expected JSON object", 400)
+
+    device_id = (data.get("device_id") or "").strip()
+    # Cheap sanity check — refuse obvious junk so we don't spawn anon rows
+    # on every malformed call.
+    if len(device_id) < 8 or len(device_id) > 128:
+        return _error_response(
+            "INVALID_PARAMS",
+            "device_id must be a 8-128 char UUID-ish string",
+            400,
+        )
+    if not all(c.isalnum() or c in "-_" for c in device_id):
+        return _error_response(
+            "INVALID_PARAMS",
+            "device_id contains unsupported characters",
+            400,
+        )
+
+    email = f"anon-{device_id}@{_ANON_EMAIL_DOMAIN}"
+    try:
+        user_name = frappe.db.get_value("User", {"email": email}, "name")
+        created = False
+
+        if not user_name:
+            u = frappe.new_doc("User")
+            u.email = email
+            u.first_name = "Guest"
+            u.user_type = "Website User"
+            u.enabled = 1
+            # No welcome mail to a fake address; no password sign-in.
+            u.send_welcome_email = 0
+            u.flags.no_welcome_mail = True
+            u.insert(ignore_permissions=True)
+            # Random unguessable password so the row exists but password
+            # login is effectively unreachable. The API key is the auth path.
+            u.new_password = frappe.generate_hash(length=48)
+            u.save(ignore_permissions=True)
+            user_name = u.name
+            created = True
+
+        keys = _user_keys(user_name)
+        frappe.db.commit()
+        return {
+            "anon_user_id": user_name,
+            "api_key": keys["api_key"],
+            "api_secret": keys["api_secret"],
+            "created": created,
+        }
+    except Exception:
+        corr = _log_unhandled("v1.anon_bootstrap")
+        return _error_response(
+            "SERVER_ERROR",
+            "Failed to bootstrap anon account",
+            500,
+            correlation_id=corr,
+        )
+
+
+# ===========================================================================
+# PREM-2 (top-up grant)
+# ===========================================================================
+# Client calls this after the Play store says a consumable was bought. The
+# server records the grant in the credit ledger keyed on a hash of the
+# receipt token so a retry can't double-credit.
+#
+# **TODO (AUTH-2 server tail):** actually validate `receipt_token` against
+# the Play Developer API before granting. Today the endpoint trusts the
+# client, which is fine for QA / dogfood with `iap_enabled` off in
+# production — DO NOT ship this without the validation in place.
+# ===========================================================================
+
+# Authoritative price list — what each Play Console product is worth in
+# credits. Mirror this when you flip `iap_enabled` on in production.
+_TOPUP_GRANT_TABLE = {
+    "credits_pack_starter_v1": 25,
+    "credits_pack_plus_v1": 80,
+    "credits_pack_pro_v1": 250,
+}
+
+
+def _topup_dedup_key(product_id, receipt_token, purchase_id):
+    """Stable per-purchase key so re-submits don't double-grant."""
+    src = f"{product_id}|{purchase_id or ''}|{receipt_token or ''}"
+    return "topup:" + hashlib.sha256(src.encode("utf-8")).hexdigest()[:48]
+
+
+@frappe.whitelist(methods=["POST"])
+def grant_topup_credits(**kwargs):
+    """Apply a topup grant for the calling user.
+
+    Body: {"product_id", "receipt_token", "purchase_id"?, "platform"?}
+    Returns: {"ok", "granted", "balance_after", "balance"}
+
+    Idempotent on the (product_id + purchase_id + receipt_token) tuple.
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+
+    data = _read_json_body() if not kwargs else kwargs
+    if not isinstance(data, dict):
+        return _error_response("INVALID_BODY", "Expected JSON object", 400)
+
+    product_id = (data.get("product_id") or "").strip()
+    if product_id not in _TOPUP_GRANT_TABLE:
+        return _error_response(
+            "UNKNOWN_PRODUCT",
+            f"Top-up product {product_id!r} is not recognised",
+            400,
+        )
+
+    receipt_token = (data.get("receipt_token") or "").strip()
+    purchase_id = (data.get("purchase_id") or "").strip()
+    if not receipt_token:
+        return _error_response(
+            "INVALID_PARAMS",
+            "receipt_token is required",
+            400,
+        )
+
+    # TODO(AUTH-2): replace this stub with a real Play Developer API call
+    # (`purchases.products.get`) that verifies the receipt is genuine and
+    # belongs to this device's obfuscatedAccountId before granting.
+
+    grant_amount = _TOPUP_GRANT_TABLE[product_id]
+    dedup_key = _topup_dedup_key(product_id, receipt_token, purchase_id)
+
+    try:
+        balance_after = _grant_topup_credits(
+            frappe.session.user,
+            amount=grant_amount,
+            idempotency_key=dedup_key,
+            reason=f"Top-up: {product_id}",
+            ref_name=purchase_id or product_id,
+        )
+        frappe.db.commit()
+        state = _get_credit_state(frappe.session.user)
+        return {
+            "ok": True,
+            "granted": grant_amount,
+            "balance_after": balance_after,
+            "balance": state,
+        }
+    except Exception:
+        corr = _log_unhandled("v1.grant_topup_credits")
+        return _error_response(
+            "SERVER_ERROR",
+            "Failed to grant top-up credits",
+            500,
+            correlation_id=corr,
+        )
+

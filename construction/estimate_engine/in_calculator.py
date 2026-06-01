@@ -79,6 +79,7 @@ def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None, u
         total += cost
 
     return {
+        "currency": "INR",
         "line_items": line_items,
         "totals": {
             "overall": round(total, 2),

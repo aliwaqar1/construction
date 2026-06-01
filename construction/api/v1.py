@@ -10,6 +10,7 @@ Frappe URLs (all allow_guest):
 
 import hashlib
 import json
+import sys
 import traceback
 import uuid
 
@@ -44,18 +45,52 @@ def _error_response(code, message, http_status=400, details=None, correlation_id
 
 
 def _log_unhandled(method_name):
-    """Log an unhandled exception with a short correlation id; return it.
+    """Record an unhandled backend exception in App Error Log; return its
+    correlation id.
 
     The id goes into the API response so the client can show a Report
-    affordance carrying it, and is suffixed onto the log title so a search
-    in Frappe's Error Log finds the matching row instantly.
+    affordance carrying it, and is stored on the App Error Log row so a search
+    finds the matching record instantly.
+
+    The current request transaction is rolled back first: it errored, so its
+    partial writes must be discarded, and a clean transaction lets us persist
+    the error row reliably. Falls back to Frappe's Error Log only if writing
+    our own row fails, so an error is never lost entirely.
     """
     corr_id = uuid.uuid4().hex[:12]
+    tb = traceback.format_exc()
+    exc_type = ""
     try:
-        frappe.log_error(traceback.format_exc(), f"{method_name} \u00b7 {corr_id}")
+        et = sys.exc_info()[0]
+        exc_type = et.__name__ if et else ""
     except Exception:
-        # Never let logging itself break the error path.
         pass
+    try:
+        frappe.db.rollback()
+        from construction.construction.doctype.app_error_log.app_error_log import (
+            AppErrorLog,
+        )
+        AppErrorLog.record(
+            source="backend",
+            level="error",
+            is_fatal=False,
+            title=f"{method_name} \u00b7 {corr_id}",
+            message=method_name,
+            error_type=exc_type,
+            stack_trace=tb,
+            route=method_name,
+            endpoint=method_name,
+            correlation_id=corr_id,
+            environment="production",
+            user=getattr(getattr(frappe, "session", None), "user", None),
+        )
+        frappe.db.commit()
+    except Exception:
+        # Last resort so the trace is never lost.
+        try:
+            frappe.log_error(tb, f"{method_name} \u00b7 {corr_id}")
+        except Exception:
+            pass
     return corr_id
 
 
@@ -1533,45 +1568,56 @@ def activate_premium(**kwargs):
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def log_client_error(**kwargs):
-    """Append a client-side error report to Frappe Error Log.
+    """Record a client-side error report in App Error Log.
 
-    Body (JSON): {message, stack, app_version, platform, route, correlation_id?,
-    device_id?}. Fields are trimmed so a runaway client cannot flood the log.
-    Returns {ok: True, correlation_id} so the client can surface the id if it
-    did not already have one.
+    Body (JSON) \u2014 all optional except message:
+      message, stack, error_type, source (app|api), level, is_fatal,
+      route, endpoint, http_method, http_status, request_id, correlation_id,
+      app_version, build_number, platform, os_version, device_model, device_id,
+      network_status, environment, breadcrumbs, context_json.
+
+    Returns {ok, correlation_id} so the client can surface the id.
     """
     try:
         data = _read_json_body() if not kwargs else kwargs
         if not isinstance(data, dict):
             data = {}
 
-        def _s(v, lim):
-            if v is None:
-                return ""
-            return str(v)[:lim]
+        correlation_id = (str(data.get("correlation_id") or "")[:64]
+                          or uuid.uuid4().hex[:12])
 
-        message = _s(data.get("message"), 500)
-        stack = _s(data.get("stack"), 4000)
-        app_version = _s(data.get("app_version"), 50)
-        platform = _s(data.get("platform"), 50)
-        route = _s(data.get("route"), 200)
-        device_id = _s(data.get("device_id"), 100)
-        correlation_id = _s(data.get("correlation_id"), 50) or uuid.uuid4().hex[:12]
-
-        title = f"client \u00b7 {platform or 'unknown'} \u00b7 {(message or 'no message')[:60]}"
-        body = (
-            f"correlation_id: {correlation_id}\n"
-            f"app_version: {app_version}\n"
-            f"platform: {platform}\n"
-            f"route: {route}\n"
-            f"device_id: {device_id}\n"
-            f"message: {message}\n\n"
-            f"stack:\n{stack}\n"
+        from construction.construction.doctype.app_error_log.app_error_log import (
+            AppErrorLog,
         )
-        try:
-            frappe.log_error(body, title)
-        except Exception:
-            pass
+        source = data.get("source") or "app"
+        AppErrorLog.record(
+            source=source if source in ("app", "api") else "app",
+            level=data.get("level"),
+            is_fatal=bool(data.get("is_fatal")),
+            title=data.get("title"),
+            message=data.get("message") or data.get("stack") or "Unknown client error",
+            error_type=data.get("error_type"),
+            # Accept both `stack` (legacy) and `stack_trace`.
+            stack_trace=data.get("stack_trace") or data.get("stack"),
+            endpoint=data.get("endpoint"),
+            http_method=data.get("http_method"),
+            http_status=data.get("http_status"),
+            request_id=data.get("request_id"),
+            route=data.get("route"),
+            correlation_id=correlation_id,
+            network_status=data.get("network_status"),
+            breadcrumbs=data.get("breadcrumbs"),
+            context_json=data.get("context_json"),
+            device_model=data.get("device_model"),
+            os_version=data.get("os_version"),
+            device_id=data.get("device_id"),
+            app_version=data.get("app_version"),
+            build_number=data.get("build_number"),
+            platform=data.get("platform"),
+            environment=data.get("environment"),
+            user=(frappe.session.user if frappe.session.user != "Guest" else None),
+        )
+        frappe.db.commit()
         return {"ok": True, "correlation_id": correlation_id}
     except Exception:
         corr = _log_unhandled("v1.log_client_error")
@@ -2232,12 +2278,26 @@ def anon_bootstrap(**kwargs):
             user_name = u.name
             created = True
 
-        keys = _user_keys(user_name)
+        # _user_keys returns a (api_key, api_secret) tuple.
+        api_key, api_secret = _user_keys(user_name)
+
+        # Grant the one-time welcome design credits, anchored on the device so a
+        # given device can only ever claim them once (idempotent). Safe to call
+        # on every bootstrap — the ledger dedups on the key.
+        try:
+            _grant_welcome_credits(
+                user_name,
+                idempotency_key=f"welcome:{device_id}",
+            )
+        except Exception:
+            # A failed grant must never block the auth handshake.
+            frappe.log_error(frappe.get_traceback(), "anon_bootstrap.welcome_grant")
+
         frappe.db.commit()
         return {
             "anon_user_id": user_name,
-            "api_key": keys["api_key"],
-            "api_secret": keys["api_secret"],
+            "api_key": api_key,
+            "api_secret": api_secret,
             "created": created,
         }
     except Exception:

@@ -1,0 +1,310 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:ERR-{YY}{MM}-{#####}",
+ "creation": "2026-06-02 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_overview",
+  "title",
+  "source",
+  "level",
+  "is_fatal",
+  "status",
+  "col_overview",
+  "app_version",
+  "build_number",
+  "environment",
+  "platform",
+  "occurrences",
+  "section_error",
+  "message",
+  "error_type",
+  "stack_trace",
+  "section_request",
+  "endpoint",
+  "http_method",
+  "col_request",
+  "http_status",
+  "request_id",
+  "section_context",
+  "route",
+  "correlation_id",
+  "network_status",
+  "col_context",
+  "breadcrumbs",
+  "context_json",
+  "section_device",
+  "device_model",
+  "os_version",
+  "device_id",
+  "col_device",
+  "user",
+  "first_seen",
+  "last_seen",
+  "section_triage",
+  "fingerprint",
+  "resolution_notes"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_overview",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "in_global_search": 1,
+   "in_list_view": 1,
+   "label": "Title",
+   "reqd": 1
+  },
+  {
+   "fieldname": "source",
+   "fieldtype": "Select",
+   "options": "app\napi\nbackend",
+   "default": "app",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Source",
+   "reqd": 1
+  },
+  {
+   "fieldname": "level",
+   "fieldtype": "Select",
+   "options": "fatal\nerror\nwarning\ninfo",
+   "default": "error",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Level"
+  },
+  {
+   "fieldname": "is_fatal",
+   "fieldtype": "Check",
+   "label": "Is Fatal"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "options": "New\nInvestigating\nResolved\nIgnored",
+   "default": "New",
+   "in_standard_filter": 1,
+   "label": "Status"
+  },
+  {
+   "fieldname": "col_overview",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "app_version",
+   "fieldtype": "Data",
+   "in_standard_filter": 1,
+   "label": "App Version"
+  },
+  {
+   "fieldname": "build_number",
+   "fieldtype": "Data",
+   "label": "Build Number"
+  },
+  {
+   "fieldname": "environment",
+   "fieldtype": "Select",
+   "options": "production\nstaging\ndevelopment\nunknown",
+   "default": "unknown",
+   "in_standard_filter": 1,
+   "label": "Environment"
+  },
+  {
+   "fieldname": "platform",
+   "fieldtype": "Select",
+   "options": "android\nios\nweb\nwindows\nmacos\nlinux\nunknown",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Platform"
+  },
+  {
+   "fieldname": "occurrences",
+   "fieldtype": "Int",
+   "default": "1",
+   "in_list_view": 1,
+   "label": "Occurrences",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_error",
+   "fieldtype": "Section Break",
+   "label": "Error"
+  },
+  {
+   "fieldname": "message",
+   "fieldtype": "Small Text",
+   "in_global_search": 1,
+   "label": "Message"
+  },
+  {
+   "fieldname": "error_type",
+   "fieldtype": "Data",
+   "in_standard_filter": 1,
+   "label": "Error Type / Code"
+  },
+  {
+   "fieldname": "stack_trace",
+   "fieldtype": "Code",
+   "options": "Text",
+   "label": "Stack Trace"
+  },
+  {
+   "fieldname": "section_request",
+   "fieldtype": "Section Break",
+   "label": "Request / API"
+  },
+  {
+   "fieldname": "endpoint",
+   "fieldtype": "Data",
+   "label": "Endpoint"
+  },
+  {
+   "fieldname": "http_method",
+   "fieldtype": "Data",
+   "label": "HTTP Method"
+  },
+  {
+   "fieldname": "col_request",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "http_status",
+   "fieldtype": "Int",
+   "in_standard_filter": 1,
+   "label": "HTTP Status"
+  },
+  {
+   "fieldname": "request_id",
+   "fieldtype": "Data",
+   "label": "Request ID"
+  },
+  {
+   "fieldname": "section_context",
+   "fieldtype": "Section Break",
+   "label": "Context"
+  },
+  {
+   "fieldname": "route",
+   "fieldtype": "Data",
+   "label": "Route / Screen"
+  },
+  {
+   "fieldname": "correlation_id",
+   "fieldtype": "Data",
+   "label": "Correlation ID",
+   "search_index": 1
+  },
+  {
+   "fieldname": "network_status",
+   "fieldtype": "Data",
+   "label": "Network Status"
+  },
+  {
+   "fieldname": "col_context",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "breadcrumbs",
+   "fieldtype": "Code",
+   "options": "JSON",
+   "label": "Breadcrumbs"
+  },
+  {
+   "fieldname": "context_json",
+   "fieldtype": "Code",
+   "options": "JSON",
+   "label": "Extra Context"
+  },
+  {
+   "fieldname": "section_device",
+   "fieldtype": "Section Break",
+   "label": "Device & User"
+  },
+  {
+   "fieldname": "device_model",
+   "fieldtype": "Data",
+   "label": "Device Model"
+  },
+  {
+   "fieldname": "os_version",
+   "fieldtype": "Data",
+   "label": "OS Version"
+  },
+  {
+   "fieldname": "device_id",
+   "fieldtype": "Data",
+   "in_standard_filter": 1,
+   "label": "Device ID",
+   "search_index": 1
+  },
+  {
+   "fieldname": "col_device",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "options": "User",
+   "label": "User"
+  },
+  {
+   "fieldname": "first_seen",
+   "fieldtype": "Datetime",
+   "label": "First Seen"
+  },
+  {
+   "fieldname": "last_seen",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Last Seen"
+  },
+  {
+   "fieldname": "section_triage",
+   "fieldtype": "Section Break",
+   "label": "Triage"
+  },
+  {
+   "fieldname": "fingerprint",
+   "fieldtype": "Data",
+   "label": "Fingerprint",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "resolution_notes",
+   "fieldtype": "Small Text",
+   "label": "Resolution Notes"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-06-02 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "construction",
+ "name": "App Error Log",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

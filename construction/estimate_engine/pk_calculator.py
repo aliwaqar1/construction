@@ -48,10 +48,14 @@ def _slab(value, slabs, default):
     return default
 
 
+# Line items hidden from the result-screen breakdown. These are abstract
+# lump-sum / lot lines with no meaningful per-unit rate to show. The materials
+# QA asked to surface (Foundation, Pump Bore, Bijli/Electric Pipe, Sanitary
+# Pipe, Electrical Wiring, Window, Wood) are intentionally NOT in this set so
+# they appear with qty + rate (QA 1.6 / 1.7).
 _NO_DISPLAY_KEYS = frozenset({
-    "foundation", "drawing", "kaasoo", "pump_bore", "bijli",
-    "sanitary_pipes", "other_expenses", "switchboard", "wiring",
-    "wood_martial", "window", "sanitary_fitting", "steel_grill",
+    "drawing", "kaasoo", "other_expenses", "switchboard",
+    "sanitary_fitting", "steel_grill",
 })
 
 
@@ -70,22 +74,21 @@ def _item(material, key, qty, unit, rate, cost, phase="gray"):
 
 
 
-def _reconcile_phase(items, per_sqft_override, covered_area_sqft):
-    """If per_sqft_override is set, scale each item's  so the phase
-    total equals override * covered_area_sqft. Returns the phase total
-    (post-scale). When the override is missing or zero, returns the
-    unscaled sum unchanged.
+def _apply_overrides(items, user_rate_overrides):
+    """Apply Pro per-material rate overrides keyed by ``material_key``.
+
+    For each line item whose key the user overrode, replace its rate and
+    recompute ``cost = qty * rate`` so the override reflects on the result
+    screen (QA 1.2). Phase-total (gray/finish per-sqft) overrides are no longer
+    supported — those inputs were removed per QA 1.4.
     """
-    if not items:
-        return 0.0
-    current = sum(i["cost"] for i in items)
-    if not per_sqft_override or per_sqft_override <= 0 or covered_area_sqft <= 0 or current <= 0:
-        return round(current, 2)
-    target = float(per_sqft_override) * float(covered_area_sqft)
-    k = target / current
-    for i in items:
-        i["cost"] = round(i["cost"] * k, 2)
-    return round(target, 2)
+    if not user_rate_overrides:
+        return
+    for it in items:
+        ov = user_rate_overrides.get(it["material_key"])
+        if ov and float(ov) > 0:
+            it["rate"] = round(float(ov), 2)
+            it["cost"] = round(it["qty"] * float(ov), 2)
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -154,18 +157,16 @@ def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None, u
             paint_type, wood_type, sanitaryfiting_type, ceiling_type,
         )
 
-    # Apply per-sqft phase overrides by scaling each item's cost so the phase
-    # total matches user_rate_overrides[<phase>_per_sqft] * covered_area_sqft.
-    # The qty/unit/rate columns stay descriptive — only  is rescaled.
-    gray_total = _reconcile_phase(
-        gray_items, user_rate_overrides.get("gray_per_sqft"), ca
-    )
-    finish_total = _reconcile_phase(
-        finish_items, user_rate_overrides.get("finish_per_sqft"), ca
-    )
+    # Apply Pro per-material rate overrides to each line item, then total.
+    _apply_overrides(gray_items, user_rate_overrides)
+    _apply_overrides(finish_items, user_rate_overrides)
+
+    gray_total = round(sum(i["cost"] for i in gray_items), 2)
+    finish_total = round(sum(i["cost"] for i in finish_items), 2)
     overall = gray_total + finish_total
 
     result = {
+        "currency": "PKR",
         "line_items": gray_items + finish_items,
         "totals": {
             "gray": round(gray_total, 2),
@@ -243,8 +244,6 @@ def _calc_gray(settings, ps, ca, foundation_type, drawing_required,
         ent_rate = settings.ent_awal_rate or 0
     else:
         ent_rate = settings.ent_dom_rate or 0
-    if user_rate_overrides.get("brick"):
-        ent_rate = user_rate_overrides["brick"]
     items.append(_item("Ent (Bricks)", "ent", ent_qty, "Pcs", ent_rate, ent_qty * ent_rate))
 
     # 8. Kaasoo Bahari (slab-based on plot_size)
@@ -259,8 +258,6 @@ def _calc_gray(settings, ps, ca, foundation_type, drawing_required,
     # 10. Cement
     c_qty = int(ca * (settings.cement_qty or 0))
     c_rate = settings.cement_rate or 0
-    if user_rate_overrides.get("cement_bag"):
-        c_rate = user_rate_overrides["cement_bag"]
     items.append(_item("Cement", "cement", c_qty, "Bags", c_rate, c_qty * c_rate))
 
     # 11. Saria (Steel)
@@ -269,8 +266,6 @@ def _calc_gray(settings, ps, ca, foundation_type, drawing_required,
         s_rate = settings.saria_local_rate or 0
     else:
         s_rate = settings.saria_branded_rate or 0
-    if user_rate_overrides.get("saria_kg"):
-        s_rate = user_rate_overrides["saria_kg"]
     items.append(_item("Saria (Steel)", "saria", s_qty, "KGs", s_rate, s_qty * s_rate))
 
     # 12. Pump Bore (conditional)

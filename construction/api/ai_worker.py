@@ -164,6 +164,71 @@ def _save_result_image(name_prefix, content, mime="image/png"):
     return file_doc.file_url
 
 
+def _wm_font(size):
+    """Best-available font for the watermark. DejaVu ships with Pillow; fall
+    back to the bitmap default if it's somehow missing."""
+    from PIL import ImageFont
+    for name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _watermark_bytes(content, label="BuildCost Pro"):
+    """Burn a tiled diagonal mark + a solid corner badge into image bytes for
+    free-tier output. Returns (jpeg_bytes, "image/jpeg"), or (content, None) on
+    any failure so a watermarking hiccup never fails the whole job."""
+    try:
+        from PIL import Image, ImageDraw
+
+        base = Image.open(io.BytesIO(content)).convert("RGBA")
+        w, h = base.size
+
+        # Tiled, semi-transparent diagonal text across the whole image — hard to
+        # crop out cleanly.
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        fsize = max(18, w // 28)
+        font = _wm_font(fsize)
+        bb = draw.textbbox((0, 0), label, font=font)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+        step_x, step_y = tw + fsize * 3, th + fsize * 3
+        row = 0
+        y = -h
+        while y < h * 2:
+            offset = 0 if row % 2 == 0 else step_x // 2
+            x = -w + offset
+            while x < w * 2:
+                draw.text((x, y), label, font=font, fill=(255, 255, 255, 64))
+                x += step_x
+            y += step_y
+            row += 1
+        layer = layer.rotate(30, expand=False)
+        base = Image.alpha_composite(base, layer)
+
+        # Solid corner badge, bottom-right, on a translucent bar.
+        d2 = ImageDraw.Draw(base, "RGBA")
+        bfsize = max(20, w // 22)
+        bfont = _wm_font(bfsize)
+        cb = d2.textbbox((0, 0), label, font=bfont)
+        bw, bh = cb[2] - cb[0], cb[3] - cb[1]
+        pad = max(6, bfsize // 2)
+        x2, y2 = w - pad, h - pad
+        x1, y1 = x2 - bw - pad * 2, y2 - bh - pad * 2
+        d2.rounded_rectangle([x1, y1, x2, y2], radius=pad, fill=(0, 0, 0, 140))
+        d2.text((x1 + pad - cb[0], y1 + pad - cb[1]), label, font=bfont,
+                fill=(255, 255, 255, 235))
+
+        out = io.BytesIO()
+        base.convert("RGB").save(out, format="JPEG", quality=90)
+        return out.getvalue(), "image/jpeg"
+    except Exception:
+        frappe.log_error(traceback.format_exc(), "ai_worker.watermark_failed")
+        return content, None
+
+
 def _require_key(vendor):
     key = ai_cfg.get_api_key(vendor)
     if not key:
@@ -542,6 +607,10 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
     images = []
     total_tokens_in = 0
     total_tokens_out = 0
+    # Free-tier output is watermarked server-side so the raw, clean image is
+    # never reachable — even by the owner reading the private file URL. Premium
+    # output is delivered clean.
+    watermark = not ai_cfg.is_premium(doc.user)
     for i, data in enumerate(results):
         try:
             cand = data["candidates"][0]
@@ -557,6 +626,10 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
                 raise _VendorError("VENDOR_RESPONSE", f"Gemini response had no image part: {data}")
             img_bytes = base64.b64decode(inline.get("data") or inline.get("data_b64") or "")
             img_mime = inline.get("mime_type") or inline.get("mimeType") or "image/png"
+            if watermark:
+                wm_bytes, wm_mime = _watermark_bytes(img_bytes)
+                if wm_mime:
+                    img_bytes, img_mime = wm_bytes, wm_mime
             url_saved = _save_result_image(f"ai_{doc.name}_v{i}", img_bytes, img_mime)
             images.append({"url": url_saved, "thumb_url": url_saved, "seed": 1000 + i * 17})
         except (KeyError, IndexError):

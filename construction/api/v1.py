@@ -988,8 +988,9 @@ def _ai_submit(tool_id, body, extra_payload):
         return _error_response("AI_DISABLED", f"Tool {tool_id} disabled", 503)
 
     user = frappe.session.user
+    is_premium = ai_cfg.is_premium(user)
 
-    if cfg.get("premium_only") and not ai_cfg.is_premium(user):
+    if cfg.get("premium_only") and not is_premium:
         return _error_response(
             "PREMIUM_REQUIRED",
             "This tool is available to premium users only.",
@@ -998,10 +999,21 @@ def _ai_submit(tool_id, body, extra_payload):
 
     quality = (body.get("quality") or "std").lower()
     if quality == "hd":
-        if not ai_cfg.is_premium(user):
+        if not is_premium:
             return _error_response("PREMIUM_REQUIRED", "HD output is premium-only.", 402)
         if not cfg.get("hd_supported"):
             return _error_response("HD_NOT_SUPPORTED", "This tool does not support HD output.", 400)
+
+    # Variations: clamp to 1..4, and force free users to a single variation.
+    # The client already caps this, but enforce server-side so a tampered
+    # client can't pull a 4-up grid (4× the Gemini cost) on the free tier.
+    try:
+        variations = int(body.get("variations") or 1)
+    except (TypeError, ValueError):
+        variations = 1
+    variations = max(1, min(4, variations))
+    if not is_premium:
+        variations = 1
 
     if not _rate_limit_check(user, tool_id, cfg.get("rate_limit_per_min")):
         return _error_response(
@@ -1010,19 +1022,45 @@ def _ai_submit(tool_id, body, extra_payload):
             429,
         )
 
+    # Single idempotency key (client UUID, from the header) that BOTH the job
+    # row and the credit debit dedupe on. Using one key keeps them in lockstep:
+    # a re-submit with a fresh key is correctly a brand-new, charged job, while
+    # a true retry (same key) is a no-op on both. (Previously the debit keyed on
+    # the request hash while the job keyed on the header — so a "Regenerate"
+    # with identical settings ran a fresh Gemini job for free.)
+    idempotency_key = _idempotency_key_from_request(body)
+    if not idempotency_key:
+        return _error_response(
+            "MISSING_PARAMS",
+            "Idempotency-Key header is required (client-generated UUID).",
+        )
+
+    # True-retry short-circuit BEFORE any debit, so a replay never even attempts
+    # a charge.
+    existing = frappe.db.get_value(
+        "AI Job",
+        {"user": user, "idempotency_key": idempotency_key},
+        "name",
+    )
+    if existing:
+        return _ai_status_payload(existing)
+
+    # Budget guard BEFORE the debit so a tripped kill switch can never strand a
+    # user's credits on a job that never runs.
+    budget_err = _check_budgets(tool_id, cfg)
+    if budget_err is not None:
+        return budget_err
+
     # PREM-4: credit ledger first, daily-quota as fallback. When credit gating
     # is off, the legacy free-daily-limit path runs unchanged so nothing
     # breaks before we have IAP wired (PREM-3) and a way for users to top up.
+    debit_key = None
+    debit_result = None
     if _credit_gating_enabled():
-        cost = _credit_cost_for(tool_id, body.get("quality"), body.get("variations"))
+        cost = _credit_cost_for(tool_id, quality, variations)
         if cost > 0:
-            # Idempotency: re-submits with the same client UUID don't debit
-            # twice. Falls back to the request hash when the header is missing.
-            debit_key = (
-                f"ai_submit:{user}:"
-                f"{(body.get('idempotency_key') or _canonical_request_hash(body))}"
-            )
-            result = _debit_credits(
+            debit_key = f"ai_submit:{user}:{idempotency_key}"
+            debit_result = _debit_credits(
                 user,
                 amount=cost,
                 ref_doctype="AI Job",
@@ -1030,7 +1068,7 @@ def _ai_submit(tool_id, body, extra_payload):
                 reason=f"AI submit: {tool_id}",
                 idempotency_key=debit_key,
             )
-            if result.get("applied", 0) < cost:
+            if debit_result.get("applied", 0) < cost:
                 state = _get_credit_state(user)
                 return _error_response(
                     "INSUFFICIENT_CREDITS",
@@ -1053,33 +1091,9 @@ def _ai_submit(tool_id, body, extra_payload):
                 details={"remaining_today": 0},
             )
 
-    budget_err = _check_budgets(tool_id, cfg)
-    if budget_err is not None:
-        return budget_err
-
-    idempotency_key = _idempotency_key_from_request(body)
-    if not idempotency_key:
-        return _error_response(
-            "MISSING_PARAMS",
-            "Idempotency-Key header is required (client-generated UUID).",
-        )
-
-    existing = frappe.db.get_value(
-        "AI Job",
-        {"user": user, "idempotency_key": idempotency_key},
-        "name",
-    )
-    if existing:
-        return _ai_status_payload(existing)
-
     payload = {k: v for k, v in body.items() if k != "idempotency_key"}
     payload.update(extra_payload or {})
-
-    try:
-        variations = int(body.get("variations") or 1)
-    except (TypeError, ValueError):
-        variations = 1
-    variations = max(1, min(4, variations))
+    payload["variations"] = variations  # persist the clamped value
 
     try:
         doc = frappe.new_doc("AI Job")
@@ -1097,8 +1111,9 @@ def _ai_submit(tool_id, body, extra_payload):
         doc.insert(ignore_permissions=True)
 
         # PREM-4: now that the job has a name, point the credit-debit rows at
-        # it so the worker can issue a refund-by-ref if the job fails.
-        if _credit_gating_enabled():
+        # it so the worker can issue a refund-by-ref if the job fails. Scoped to
+        # THIS submit's debit key so we never touch another job's ledger rows.
+        if debit_key:
             try:
                 frappe.db.sql(
                     """update `tabAI Credit Ledger`
@@ -1110,7 +1125,7 @@ def _ai_submit(tool_id, body, extra_payload):
                     {
                         "name": doc.name,
                         "user": user,
-                        "key_prefix": f"ai_submit:{user}:%",
+                        "key_prefix": f"{debit_key}%",
                     },
                 )
             except Exception:
@@ -1133,6 +1148,14 @@ def _ai_submit(tool_id, body, extra_payload):
         return _ai_status_payload(doc.name)
     except Exception:
         corr = _log_unhandled(f"v1.ai_submit:{tool_id}")
+        # Compensate the debit so a crash before the job is safely enqueued can
+        # never leave the user charged for nothing.
+        if debit_result and debit_result.get("applied", 0) > 0:
+            try:
+                _reverse_debit(user, debit_key, debit_result)
+                frappe.db.commit()
+            except Exception:
+                frappe.log_error(frappe.get_traceback(), "v1.ai_submit.reverse_failed")
         return _error_response(
             "SERVER_ERROR", "Failed to enqueue AI job", 500, correlation_id=corr
         )
@@ -1970,6 +1993,43 @@ def _grant_welcome_credits(user, amount=_DEFAULT_WELCOME_QUOTA, idempotency_key=
     )
 
 
+# Per-IP daily ceiling on NEW welcome grants. This is a *secondary* speed bump
+# against credit farming via rotating device_ids — NOT a real defense. The real
+# fix is Play Integrity attestation on the device_id at bootstrap (needs client
+# work); the hard money backstop is the global budget kill switch in
+# `_check_budgets`. Kept generous because this is a mobile app: carrier-grade
+# NAT can route many legitimate new installs through one IP, so a tight cap
+# would deny real users their welcome credits. Fail-open everywhere.
+_WELCOME_IP_DAILY_CAP = 50
+
+
+def _welcome_ip_allowed():
+    """True if this client IP hasn't exceeded the daily new-welcome-grant cap.
+    Fail-open: any cache/lookup error returns True so we never block a real
+    user's onboarding over a counter."""
+    try:
+        ip = getattr(frappe.local, "request_ip", None)
+        if not ip and frappe.request:
+            fwd = frappe.request.headers.get("X-Forwarded-For", "")
+            ip = fwd.split(",")[0].strip() if fwd else None
+        if not ip:
+            return True
+        from frappe.utils import nowdate
+        key = f"welcome_ip:{ip}:{nowdate()}"
+        cache = frappe.cache()
+        n = cache.get_value(key) or 0
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= _WELCOME_IP_DAILY_CAP:
+            return False
+        cache.set_value(key, n + 1, expires_in_sec=60 * 60 * 36)
+        return True
+    except Exception:
+        return True
+
+
 def _grant_topup_credits(user, amount, idempotency_key, reason=None, ref_name=None):
     """Idempotent on the receipt-derived `idempotency_key`. Adds to the topup
     bucket which never expires.
@@ -2109,6 +2169,41 @@ def _refund_credits(user, ref_doctype, ref_name, reason=None):
         )
 
     return {"applied": monthly_amt + topup_amt, "balance_after": balance_after}
+
+
+def _reverse_debit(user, debit_key, debit_result):
+    """Compensating reversal for a debit that succeeded but whose job failed to
+    enqueue (so the ref_name backfill never ran and `_refund_credits`, which
+    keys on ref, can't find it). Mirrors the per-bucket amounts back into the
+    ledger. Idempotent on a derived reversal key.
+    """
+    if not debit_result:
+        return
+    monthly_taken = int(debit_result.get("monthly_taken", 0) or 0)
+    topup_taken = int(debit_result.get("topup_taken", 0) or 0)
+    if monthly_taken > 0:
+        _insert_ledger_event(
+            user,
+            event_type="refund_failure",
+            bucket="monthly",
+            delta=monthly_taken,
+            reason="Reversed: submit crashed before enqueue",
+            ref_doctype="AI Job",
+            ref_name="",
+            idempotency_key=f"{debit_key}:reversal:monthly",
+            period_month=_current_period_month(),
+        )
+    if topup_taken > 0:
+        _insert_ledger_event(
+            user,
+            event_type="refund_failure",
+            bucket="topup",
+            delta=topup_taken,
+            reason="Reversed: submit crashed before enqueue",
+            ref_doctype="AI Job",
+            ref_name="",
+            idempotency_key=f"{debit_key}:reversal:topup",
+        )
 
 
 @frappe.whitelist()
@@ -2282,16 +2377,18 @@ def anon_bootstrap(**kwargs):
         api_key, api_secret = _user_keys(user_name)
 
         # Grant the one-time welcome design credits, anchored on the device so a
-        # given device can only ever claim them once (idempotent). Safe to call
-        # on every bootstrap — the ledger dedups on the key.
-        try:
-            _grant_welcome_credits(
-                user_name,
-                idempotency_key=f"welcome:{device_id}",
-            )
-        except Exception:
-            # A failed grant must never block the auth handshake.
-            frappe.log_error(frappe.get_traceback(), "anon_bootstrap.welcome_grant")
+        # given device can only ever claim them once (idempotent). Only on first
+        # creation of this device row, and only within the per-IP daily cap, to
+        # slow credit farming via rotating device_ids. A failed/denied grant
+        # never blocks the auth handshake.
+        if created and _welcome_ip_allowed():
+            try:
+                _grant_welcome_credits(
+                    user_name,
+                    idempotency_key=f"welcome:{device_id}",
+                )
+            except Exception:
+                frappe.log_error(frappe.get_traceback(), "anon_bootstrap.welcome_grant")
 
         frappe.db.commit()
         return {

@@ -254,6 +254,17 @@ def estimate(**kwargs):
     if not isinstance(answers, dict):
         return _error_response("INVALID_PARAMS", "'answers' must be a JSON object")
 
+    # ── Premium gate (defense-in-depth) ──
+    # Custom material rate overrides are a Pro feature. The client hides the UI
+    # for non-premium users and re-gates before sending, but a tampered client
+    # could still inject `rate_overrides` into `answers`. Strip them unless the
+    # authenticated caller is premium. Anonymous/guest callers are never premium
+    # (is_premium returns False for "Guest"), so free estimates ignore overrides.
+    if isinstance(answers.get("rate_overrides"), dict) and answers["rate_overrides"]:
+        from construction.construction.doctype.ai_settings import ai_settings as ai_cfg
+        if not ai_cfg.is_premium(frappe.session.user):
+            answers = {k: v for k, v in answers.items() if k != "rate_overrides"}
+
     # ── Compute ──
     try:
         result = resolve_estimate(country, city, plot_size, covered_area, answers)

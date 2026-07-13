@@ -97,7 +97,13 @@
   "steel_stainless_rate",
   "steel_stainless_qty",
   "stair_and_kitchen_marble_column",
-  "stair_and_kitchen_marble_rate"
+  "stair_and_kitchen_marble_rate",
+  "basement_column",
+  "basement_excavation_qty",
+  "basement_excavation_rate",
+  "basement_wall_height_ft",
+  "basement_retaining_rate",
+  "basement_waterproofing_rate"
  ],
  "fields": [
   {
@@ -558,6 +564,37 @@
    "fieldname": "stair_and_kitchen_marble_rate",
    "fieldtype": "Int",
    "label": "Stair and Kitchen Marble with lab Rate "
+  },
+  {
+   "fieldname": "basement_column",
+   "fieldtype": "Column Break",
+   "label": "Basement"
+  },
+  {
+   "fieldname": "basement_excavation_qty",
+   "fieldtype": "Float",
+   "label": "Basement Excavation Qty (cft dug per sq ft of basement)",
+   "description": "Effective dig depth in ft. 10 = a 10 ft deep excavation."
+  },
+  {
+   "fieldname": "basement_excavation_rate",
+   "fieldtype": "Int",
+   "label": "Basement Excavation Rate (per cft)"
+  },
+  {
+   "fieldname": "basement_wall_height_ft",
+   "fieldtype": "Float",
+   "label": "Basement Retaining Wall Height (ft)"
+  },
+  {
+   "fieldname": "basement_retaining_rate",
+   "fieldtype": "Int",
+   "label": "Basement Retaining Wall Rate (per sq ft of wall)"
+  },
+  {
+   "fieldname": "basement_waterproofing_rate",
+   "fieldtype": "Int",
+   "label": "Basement Waterproofing Rate (per sq ft of slab + wall)"
   }
  ],
  "index_web_pages_for_search": 1,

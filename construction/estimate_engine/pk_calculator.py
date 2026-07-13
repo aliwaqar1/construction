@@ -94,7 +94,8 @@ def _apply_overrides(items, user_rate_overrides):
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None, user_rate_overrides=None):
+def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None,
+            user_rate_overrides=None, basement=None):
     """
     Compute a Pakistan house estimate.
 
@@ -108,6 +109,13 @@ def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None, u
                             -- per-floor covered areas in sq ft (index 0 = ground).
                                When omitted, treated as a single floor of
                                ``covered_area_sqft``.
+    basement : dict | None  -- ``{"enabled": bool, "area_sqft": float}`` from the
+                               engine. The basement's floor area already sits
+                               inside ``covered_area_sqft``, so it is buying the
+                               same bricks / cement / labour as any other storey.
+                               What it adds here is the below-grade work a normal
+                               floor does not need: excavation, retaining walls
+                               and tanking.
     """
     settings = frappe.get_single("Construction Setting")
     ps = plot_size_sqft
@@ -155,6 +163,12 @@ def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None, u
         finish_items = _calc_finish(
             settings, ca, flooring_type, wiring_type, window_type,
             paint_type, wood_type, sanitaryfiting_type, ceiling_type,
+        )
+
+    # ---- basement works (below-grade extras) ----
+    if basement and basement.get("enabled"):
+        gray_items.extend(
+            _calc_basement(settings, float(basement.get("area_sqft") or 0))
         )
 
     # Apply Pro per-material rate overrides to each line item, then total.
@@ -309,6 +323,60 @@ def _calc_gray(settings, ps, ca, foundation_type, drawing_required,
 
 
 # ---------------------------------------------------------------------------
+# Basement
+# ---------------------------------------------------------------------------
+
+def _calc_basement(settings, area_sqft):
+    """Below-grade works for a basement of ``area_sqft``.
+
+    A basement used to cost exactly what an above-grade storey costs: its area
+    was folded into ``covered_area_sqft`` by the client and nothing else about
+    it was ever priced -- no dig, no retaining wall, no tanking.
+
+    Wall length is derived from the area by assuming a square footprint
+    (perimeter = 4 * sqrt(area)), because the questionnaire collects an area and
+    never asks for plot dimensions. A square is the perimeter-minimising shape,
+    so this is the *low* estimate for any real rectangular plot -- it under-
+    prices a long, narrow basement rather than over-promising a cheap one.
+
+    Rates are seeded as placeholders and are meant to be tuned in
+    Construction Setting; every line no-ops when its rate is left at 0.
+    """
+    if not area_sqft or area_sqft <= 0:
+        return []
+
+    items = []
+
+    # Perimeter of an equivalent square footprint, and the wall face area.
+    perimeter_ft = 4 * (area_sqft ** 0.5)
+    wall_height = settings.basement_wall_height_ft or 0
+    wall_area = perimeter_ft * wall_height
+
+    # 1. Excavation -- volume of soil removed. `basement_excavation_qty` is the
+    #    effective dig depth (cft removed per sq ft of basement floor).
+    exc_qty = area_sqft * (settings.basement_excavation_qty or 0)
+    exc_rate = settings.basement_excavation_rate or 0
+    if exc_qty > 0 and exc_rate > 0:
+        items.append(_item("Basement Excavation", "basement_excavation",
+                           exc_qty, "CFT", exc_rate, exc_qty * exc_rate))
+
+    # 2. Retaining wall -- holds back the earth on every face.
+    ret_rate = settings.basement_retaining_rate or 0
+    if wall_area > 0 and ret_rate > 0:
+        items.append(_item("Basement Retaining Wall", "basement_retaining",
+                           wall_area, "SF", ret_rate, wall_area * ret_rate))
+
+    # 3. Waterproofing / tanking -- the slab plus the wall faces.
+    wp_qty = area_sqft + wall_area
+    wp_rate = settings.basement_waterproofing_rate or 0
+    if wp_qty > 0 and wp_rate > 0:
+        items.append(_item("Basement Waterproofing", "basement_waterproofing",
+                           wp_qty, "SF", wp_rate, wp_qty * wp_rate))
+
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Finish
 # ---------------------------------------------------------------------------
 
@@ -317,17 +385,25 @@ def _calc_finish(settings, ca, flooring_type, wiring_type, window_type,
     items = []
 
     # 1. Floor
+    #
+    # `marble_rate` / `tile_rate` are stored PER SQ FT, like every other rate on
+    # Construction Setting. The original code priced marble as `qty_sqft * rate`
+    # and priced tile as `(qty_sqft * 0.092903) * (rate * 10.7639)` -- the same
+    # cost, merely *displayed* in sqm. A later refactor unified the two branches
+    # on the sqm form but dropped the `* 10.7639` rate scaling, which silently
+    # divided all flooring cost by 10.76.
+    #
+    # Quote in sq ft and the whole problem goes away: it matches the stored rate,
+    # matches Flooring Labour directly below, and matches every other line item.
     floor_qty = int(ca * (settings.floor_qty or 0))
     if flooring_type == "Marble":
         fl_rate = settings.marble_rate or 0
-        fl_qty_m = round(floor_qty * 0.092903, 2)  # sqft -> sqm
-        fl_cost = fl_qty_m * fl_rate
-        items.append(_item("Floor (Marble)", "floor", fl_qty_m, "m", fl_rate, fl_cost, "finish"))
+        fl_label = "Floor (Marble)"
     else:
         fl_rate = settings.tile_rate or 0
-        fl_qty_m = round(floor_qty * 0.092903, 2)  # sqft -> sqm
-        fl_cost = fl_qty_m * fl_rate
-        items.append(_item("Floor (Tile)", "floor", fl_qty_m, "m", fl_rate, fl_cost, "finish"))
+        fl_label = "Floor (Tile)"
+    items.append(_item(fl_label, "floor", floor_qty, "SF",
+                       fl_rate, floor_qty * fl_rate, "finish"))
 
     # 2. Flooring Labour
     fl_lab_rate = settings.floor_labour_rate or 0
@@ -335,9 +411,14 @@ def _calc_finish(settings, ca, flooring_type, wiring_type, window_type,
                        fl_lab_rate, floor_qty * fl_lab_rate, "finish"))
 
     # 3. Bathroom Tile
+    #
+    # `bathroom_tile_rate` is per SQ FT and `bt_qty` is a sqft area (a fraction
+    # of the covered area), so the cost below is correct -- but the line used to
+    # report its unit as "m", claiming square metres for a quantity that was
+    # never converted. Owner-confirmed as per-sqft; the label was the only bug.
     bt_qty = int(ca * (settings.bathroom_tile_qty or 0))
     bt_rate = settings.bathroom_tile_rate or 0
-    items.append(_item("Bathroom Tile", "bathroom_tile", bt_qty, "m",
+    items.append(_item("Bathroom Tile", "bathroom_tile", bt_qty, "SF",
                        bt_rate, bt_qty * bt_rate, "finish"))
 
     # 4. Chat Tile

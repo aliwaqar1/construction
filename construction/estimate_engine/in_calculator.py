@@ -11,7 +11,8 @@ If no questionnaire answers are provided, defaults are used
 import frappe
 
 
-def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None, user_rate_overrides=None):
+def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None,
+            user_rate_overrides=None, basement=None):
     """
     Compute an India house estimate.
 
@@ -21,6 +22,18 @@ def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None, u
     plot_size_sqft : float  – (unused in V1 — kept for interface parity)
     covered_area_sqft : float
     params : dict           – merged parameter map from questionnaire impacts
+    basement : dict | None  – (unused in V1 — kept for interface parity). The
+                              basement's area is already inside
+                              ``covered_area_sqft``, so it is priced as ordinary
+                              floor area; the below-grade extras the PK engine
+                              adds (excavation, retaining wall, tanking) have no
+                              India rates yet.
+
+    Note: ``floor_areas`` and ``user_rate_overrides`` are likewise accepted and
+    ignored. ``v1.estimate`` reports ``overrides_applied`` off the premium check
+    alone, so it would claim overrides this calculator never applied — the client
+    hides the custom-rates card outside Pakistan, which is the only thing keeping
+    that honest today.
     """
     material_quality = params.get("material_quality", "Medium")
     sqft = covered_area_sqft
@@ -56,7 +69,6 @@ def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None, u
     )
 
     line_items = []
-    total = 0.0
 
     for m in materials:
         ratio = (
@@ -76,12 +88,18 @@ def compute(city, plot_size_sqft, covered_area_sqft, params, floor_areas=None, u
             "cost": round(cost, 2),
             "display": True,
         })
-        total += cost
+
+    # Total the ROUNDED line costs, the way pk_calculator does. Accumulating the
+    # raw floats and rounding once at the end drifts away from the sum of what
+    # the user is actually shown -- the breakdown then does not add up to its
+    # own total (a paisa on a 12-item estimate, but it grows with the line count
+    # and it is the sort of thing a contractor notices).
+    total = round(sum(i["cost"] for i in line_items), 2)
 
     return {
         "currency": "INR",
         "line_items": line_items,
         "totals": {
-            "overall": round(total, 2),
+            "overall": total,
         },
     }

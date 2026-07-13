@@ -48,6 +48,7 @@ def resolve_estimate(country, city, plot_size_sqft, covered_area_sqft, answers):
 
     floor_areas = _extract_floor_areas(answers, covered_area_sqft)
     user_rate_overrides = _extract_rate_overrides(answers)
+    basement = _extract_basement(answers)
 
     # 1. Load questionnaire
     q_doc = frappe.get_all(
@@ -74,6 +75,7 @@ def resolve_estimate(country, city, plot_size_sqft, covered_area_sqft, answers):
         params,
         floor_areas=floor_areas,
         user_rate_overrides=user_rate_overrides,
+        basement=basement,
     )
 
 
@@ -98,13 +100,38 @@ def _extract_floor_areas(answers, covered_area_sqft):
     return [covered_area_sqft]
 
 
+def _extract_basement(answers):
+    """Pull the basement selection out of answers.
+
+    Basement is collected on the client's plot-info step, not the questionnaire,
+    so it never passes through merge_impacts and can't arrive as a param --
+    it has to be read straight off answers.
+
+    Returns {"enabled": bool, "area_sqft": float}. enabled is only true
+    when we also have a positive area to price, so a client that sets the flag
+    without sending basement_area_sqft degrades to no basement works rather
+    than to a zero-qty line.
+    """
+    a = answers or {}
+    if not a.get("basement"):
+        return {"enabled": False, "area_sqft": 0.0}
+    try:
+        area = float(a.get("basement_area_sqft") or 0)
+    except (TypeError, ValueError):
+        area = 0.0
+    if not (area > 0) or area != area or area in (float("inf"), float("-inf")):
+        return {"enabled": False, "area_sqft": 0.0}
+    return {"enabled": True, "area_sqft": area}
+
+
 def _extract_rate_overrides(answers):
     """Pull Pro per-material rate overrides out of answers.
 
-    Shape: {material_key: number}. Recognised keys: gray_per_sqft,
-    finish_per_sqft, cement_bag, saria_kg, brick. Unknown keys
-    are forwarded to calculators verbatim so future overrides do not require
-    an engine update.
+    Shape: {material_key: number} keyed by the calculator line-item
+    material_key (e.g. cement, saria, ent, bajri, rori, rait_ravi,
+    rait_chanab, gate_chaukhat, labour, floor, bathroom_tile, termite).
+    Keys are forwarded to calculators verbatim so new overrides do not
+    require an engine update; keys matching no line item are no-ops.
     """
     raw = (answers or {}).get("rate_overrides")
     if not isinstance(raw, dict):

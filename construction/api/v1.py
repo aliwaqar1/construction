@@ -186,6 +186,37 @@ def questionnaire(country=None, city=None, flow=None):
 # POST /v1/estimate
 # ---------------------------------------------------------------------------
 
+# Requests per rolling minute allowed per caller on /v1/estimate. The client
+# LIVE bar debounces at 450 ms, so a very active user peaks well under this;
+# the cap exists to stop a guest scripting the open endpoint.
+ESTIMATE_RATE_LIMIT_PER_MIN = 60
+
+
+def _estimate_rate_limited():
+    # True when the caller exceeded ESTIMATE_RATE_LIMIT_PER_MIN. Keyed by
+    # session user, falling back to request IP for guests. Fails OPEN: a
+    # cache outage must never take the estimate endpoint down with it.
+    try:
+        user = getattr(getattr(frappe, "session", None), "user", None)
+        if user and user != "Guest":
+            ident = user
+        else:
+            ident = getattr(frappe.local, "request_ip", None) or "unknown"
+        key = f"est_rl:{ident}"
+        cache = frappe.cache()
+        current = cache.get_value(key) or 0
+        try:
+            current = int(current)
+        except (TypeError, ValueError):
+            current = 0
+        if current >= ESTIMATE_RATE_LIMIT_PER_MIN:
+            return True
+        cache.set_value(key, current + 1, expires_in_sec=60)
+        return False
+    except Exception:
+        return False
+
+
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def estimate(**kwargs):
     """Compute a construction estimate."""
@@ -245,6 +276,13 @@ def estimate(**kwargs):
             "'plot_size_sqft' and 'covered_area_sqft' must be numeric",
         )
 
+    import math
+    if not (math.isfinite(plot_size) and math.isfinite(covered_area)):
+        return _error_response(
+            "INVALID_PARAMS",
+            "'plot_size_sqft' and 'covered_area_sqft' must be finite numbers",
+        )
+
     if plot_size <= 0 or covered_area <= 0:
         return _error_response(
             "INVALID_PARAMS",
@@ -254,20 +292,36 @@ def estimate(**kwargs):
     if not isinstance(answers, dict):
         return _error_response("INVALID_PARAMS", "'answers' must be a JSON object")
 
+    if _estimate_rate_limited():
+        return _error_response(
+            "RATE_LIMITED",
+            "Too many estimate requests. Please slow down.",
+            429,
+        )
+
     # ── Premium gate (defense-in-depth) ──
     # Custom material rate overrides are a Pro feature. The client hides the UI
     # for non-premium users and re-gates before sending, but a tampered client
     # could still inject `rate_overrides` into `answers`. Strip them unless the
     # authenticated caller is premium. Anonymous/guest callers are never premium
     # (is_premium returns False for "Guest"), so free estimates ignore overrides.
-    if isinstance(answers.get("rate_overrides"), dict) and answers["rate_overrides"]:
+    # Whatever happens is echoed back as `overrides_applied` so the client can
+    # tell the user instead of silently pricing with defaults.
+    overrides_requested = bool(
+        isinstance(answers.get("rate_overrides"), dict) and answers["rate_overrides"]
+    )
+    overrides_applied = overrides_requested
+    if overrides_requested:
         from construction.construction.doctype.ai_settings import ai_settings as ai_cfg
         if not ai_cfg.is_premium(frappe.session.user):
             answers = {k: v for k, v in answers.items() if k != "rate_overrides"}
+            overrides_applied = False
 
     # ── Compute ──
     try:
         result = resolve_estimate(country, city, plot_size, covered_area, answers)
+        if overrides_requested:
+            result["overrides_applied"] = overrides_applied
         return result
     except frappe.ValidationError as e:
         return _error_response("VALIDATION_ERROR", str(e), 422)
@@ -615,7 +669,7 @@ def get_estimate(name=None):
 
 
 @frappe.whitelist(methods=["POST"])
-def delete_estimate(name=None):
+def delete_estimate(name=None, client_id=None):
     try:
         _require_auth()
     except frappe.AuthenticationError:
@@ -623,8 +677,21 @@ def delete_estimate(name=None):
 
     data = _read_json_body() or {}
     name = name or data.get("name")
+    client_id = client_id or data.get("client_id")
+    # Rows created via sync/save are keyed by client_id on the device; let the
+    # client delete by client_id when it never learned the server doc name.
+    if not name and client_id:
+        name = frappe.db.get_value(
+            "Estimate History",
+            {"client_id": client_id, "user": frappe.session.user},
+            "name",
+        )
+        if not name:
+            # Nothing on the server for this client_id - treat as success so
+            # a local-only delete is idempotent.
+            return {"ok": True, "not_found": True}
     if not name:
-        return _error_response("MISSING_PARAMS", "'name' is required")
+        return _error_response("MISSING_PARAMS", "'name' or 'client_id' is required")
 
     if not frappe.db.exists("Estimate History", name):
         return _error_response("NOT_FOUND", "Estimate not found", 404)

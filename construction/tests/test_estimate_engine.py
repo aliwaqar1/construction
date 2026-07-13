@@ -14,7 +14,7 @@ Run with:
 import unittest
 from unittest.mock import MagicMock, patch
 
-from construction.estimate_engine.engine import merge_impacts
+from construction.estimate_engine.engine import _extract_basement, merge_impacts
 from construction.estimate_engine.pk_calculator import (
     DRAWING_DEFAULT,
     DRAWING_SLABS,
@@ -22,6 +22,7 @@ from construction.estimate_engine.pk_calculator import (
     KAASOO_SLABS,
     OTHER_DEFAULT,
     OTHER_SLABS,
+    _calc_basement,
     _calc_finish,
     _calc_gray,
     _item,
@@ -133,6 +134,10 @@ def _mock_settings(**overrides):
         "sanitary_local_rate": 20, "sanitary_branded_rate": 40,
         "gate_16g_rate": 60, "gate_18g_rate": 45,
         "labour_rate": 350,
+        # basement works
+        "basement_excavation_qty": 10.0, "basement_excavation_rate": 30,
+        "basement_wall_height_ft": 10.0, "basement_retaining_rate": 450,
+        "basement_waterproofing_rate": 120,
         # finish fields
         "floor_qty": 1.0, "marble_rate": 150, "tile_rate": 80,
         "floor_labour_rate": 25,
@@ -357,7 +362,13 @@ class TestFinishCalculation(unittest.TestCase):
         items = _calc_finish(s, 1000, "Marble", "Branded", "Aluminium",
                              "YES", "Branded", "Branded", True)
         floor = next(i for i in items if i["material_key"] == "floor")
-        # qty = int(1000*1.0) = 1000, rate = 150, cost = 150000
+        # qty = int(1000*1.0) = 1000 sqft, rate = 150/sqft, cost = 150000.
+        # This assertion is ORIGINAL and was correct: it started failing when a
+        # refactor re-expressed the qty in sqm without scaling the per-sqft rate
+        # up by 10.7639, quietly cutting flooring cost to a tenth. Do not
+        # "update" it to match the code -- it is the canary.
+        self.assertEqual(floor["unit"], "SF")
+        self.assertEqual(floor["qty"], 1000)
         self.assertEqual(floor["cost"], 150000)
 
     def test_tile_floor(self):
@@ -365,7 +376,33 @@ class TestFinishCalculation(unittest.TestCase):
         items = _calc_finish(s, 1000, "Tile", "Branded", "Aluminium",
                              "YES", "Branded", "Branded", False)
         floor = next(i for i in items if i["material_key"] == "floor")
-        self.assertGreater(floor["cost"], 0)
+        # Tile is priced on the same per-sqft basis as marble: 1000 sqft @ 80.
+        self.assertEqual(floor["unit"], "SF")
+        self.assertEqual(floor["cost"], 80000)
+
+    def test_floor_priced_per_sqft_not_sqm(self):
+        # Regression guard for the 10.76x flooring undercharge: pricing the sqm
+        # qty at the per-sqft rate would give 92.9 * 150 = 13,935.
+        s = _mock_settings()
+        items = _calc_finish(s, 1000, "Marble", "Branded", "Aluminium",
+                             "YES", "Branded", "Branded", False)
+        floor = next(i for i in items if i["material_key"] == "floor")
+        self.assertNotAlmostEqual(floor["cost"], 13935.0, places=0)
+        self.assertAlmostEqual(floor["cost"], floor["qty"] * floor["rate"], places=2)
+
+    def test_bathroom_tile_is_per_sqft(self):
+        # Owner-confirmed: bathroom_tile_rate is per SQ FT and the qty is a
+        # sqft area, so cost = qty * rate. The line used to report unit "m",
+        # claiming square metres for a quantity that was never converted --
+        # cosmetic, but it made a correct number look like a 10.76x error.
+        s = _mock_settings()
+        items = _calc_finish(s, 1000, "Marble", "Branded", "Aluminium",
+                             "YES", "Branded", "Branded", False)
+        bt = next(i for i in items if i["material_key"] == "bathroom_tile")
+        self.assertEqual(bt["unit"], "SF")
+        # qty = int(1000 * 0.3) = 300 sqft @ 90/sqft
+        self.assertEqual(bt["qty"], 300)
+        self.assertEqual(bt["cost"], 27000)
 
     def test_ceiling_conditional(self):
         s = _mock_settings()
@@ -426,6 +463,141 @@ class TestPKCompute(unittest.TestCase):
             result["totals"]["overall"],
             result["totals"]["gray"] + result["totals"]["finish"],
         )
+
+
+# ===================================================================
+# Test: basement works
+#
+# A basement used to cost exactly what an above-grade storey cost -- the client
+# folded its area into covered_area_sqft and no below-grade work was priced at
+# all. "basement" never even reached the calculator: it is collected on the
+# plot-info step, so it is not a questionnaire answer and never became a param.
+# ===================================================================
+
+class TestBasementExtraction(unittest.TestCase):
+    """The engine has to read basement off `answers` directly."""
+
+    def test_absent_when_flag_false(self):
+        b = _extract_basement({"basement": False, "basement_area_sqft": 900})
+        self.assertFalse(b["enabled"])
+
+    def test_absent_when_no_answers(self):
+        self.assertFalse(_extract_basement({})["enabled"])
+        self.assertFalse(_extract_basement(None)["enabled"])
+
+    def test_enabled_with_area(self):
+        b = _extract_basement({"basement": True, "basement_area_sqft": 900})
+        self.assertTrue(b["enabled"])
+        self.assertEqual(b["area_sqft"], 900.0)
+
+    def test_flag_without_area_degrades_to_off(self):
+        # An older client sends the flag but no area. Better to price no
+        # basement than to emit zero-qty basement lines.
+        b = _extract_basement({"basement": True})
+        self.assertFalse(b["enabled"])
+
+    def test_garbage_area_degrades_to_off(self):
+        for bad in ("abc", None, -5, 0, float("inf"), float("nan")):
+            b = _extract_basement({"basement": True, "basement_area_sqft": bad})
+            self.assertFalse(b["enabled"], msg="area=%r should disable" % (bad,))
+
+
+class TestBasementCalculation(unittest.TestCase):
+
+    def test_no_items_for_zero_area(self):
+        self.assertEqual(_calc_basement(_mock_settings(), 0), [])
+
+    def test_excavation_is_area_times_dig_depth(self):
+        items = _calc_basement(_mock_settings(), 900)
+        exc = next(i for i in items if i["material_key"] == "basement_excavation")
+        # 900 sqft x 10 cft/sqft dug = 9,000 cft @ 30
+        self.assertEqual(exc["qty"], 9000.0)
+        self.assertEqual(exc["unit"], "CFT")
+        self.assertEqual(exc["cost"], 270000.0)
+
+    def test_retaining_wall_uses_square_perimeter(self):
+        items = _calc_basement(_mock_settings(), 900)
+        ret = next(i for i in items if i["material_key"] == "basement_retaining")
+        # perimeter of an equivalent square = 4 * sqrt(900) = 120 ft,
+        # x 10 ft high = 1,200 sqft of wall face @ 450
+        self.assertEqual(ret["qty"], 1200.0)
+        self.assertEqual(ret["cost"], 540000.0)
+
+    def test_waterproofing_covers_slab_plus_walls(self):
+        items = _calc_basement(_mock_settings(), 900)
+        wp = next(i for i in items if i["material_key"] == "basement_waterproofing")
+        # 900 slab + 1,200 wall = 2,100 sqft @ 120
+        self.assertEqual(wp["qty"], 2100.0)
+        self.assertEqual(wp["cost"], 252000.0)
+
+    def test_zero_rate_drops_the_line(self):
+        # Rates ship as placeholders; an owner who zeroes one should not get a
+        # free line item priced at nothing.
+        items = _calc_basement(_mock_settings(basement_retaining_rate=0), 900)
+        keys = {i["material_key"] for i in items}
+        self.assertNotIn("basement_retaining", keys)
+        self.assertIn("basement_excavation", keys)
+
+    def test_all_lines_are_gray_phase_and_displayed(self):
+        for it in _calc_basement(_mock_settings(), 900):
+            self.assertEqual(it["phase"], "gray")
+            self.assertTrue(it["display"])
+
+
+class TestBasementInCompute(unittest.TestCase):
+    """compute() must add the works AND keep the totals reconciling."""
+
+    @patch("construction.estimate_engine.pk_calculator.frappe")
+    def test_basement_adds_works_on_top_of_floor_area(self, mock_frappe):
+        mock_frappe.get_single.return_value = _mock_settings()
+        from construction.estimate_engine.pk_calculator import compute
+
+        # Same covered area both times, so the ONLY difference is the works.
+        without = compute("Lahore", 2000, 1800, {"construction_type": "gray"})
+        with_b = compute(
+            "Lahore", 2000, 1800, {"construction_type": "gray"},
+            basement={"enabled": True, "area_sqft": 900},
+        )
+
+        works = [i for i in with_b["line_items"]
+                 if i["material_key"].startswith("basement")]
+        self.assertEqual(len(works), 3)
+
+        delta = with_b["totals"]["overall"] - without["totals"]["overall"]
+        self.assertAlmostEqual(delta, sum(i["cost"] for i in works), places=2)
+
+    @patch("construction.estimate_engine.pk_calculator.frappe")
+    def test_totals_still_reconcile(self, mock_frappe):
+        mock_frappe.get_single.return_value = _mock_settings()
+        from construction.estimate_engine.pk_calculator import compute
+
+        r = compute(
+            "Lahore", 2000, 1800, {"construction_type": "both"},
+            basement={"enabled": True, "area_sqft": 900},
+        )
+        self.assertAlmostEqual(
+            r["totals"]["overall"],
+            sum(i["cost"] for i in r["line_items"]),
+            places=2,
+        )
+        self.assertAlmostEqual(
+            r["totals"]["overall"],
+            r["totals"]["gray"] + r["totals"]["finish"],
+            places=2,
+        )
+
+    @patch("construction.estimate_engine.pk_calculator.frappe")
+    def test_no_basement_means_no_basement_lines(self, mock_frappe):
+        mock_frappe.get_single.return_value = _mock_settings()
+        from construction.estimate_engine.pk_calculator import compute
+
+        for arg in (None, {"enabled": False, "area_sqft": 0}):
+            r = compute("Lahore", 2000, 1800, {"construction_type": "gray"},
+                        basement=arg)
+            self.assertFalse(
+                any(i["material_key"].startswith("basement")
+                    for i in r["line_items"])
+            )
 
 
 if __name__ == "__main__":

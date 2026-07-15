@@ -144,6 +144,14 @@ fixtures = [
 # Scheduled Tasks
 # ---------------
 
+scheduler_events = {
+    "daily": [
+        # Monthly Pro credit top-ups (idempotent per user+period, so daily
+        # runs just make each grant land on the first run of the month).
+        "construction.api.v1.grant_monthly_credits_for_active_pros",
+    ],
+}
+
 # scheduler_events = {
 # 	"all": [
 # 		"construction.tasks.all"

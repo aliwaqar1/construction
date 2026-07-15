@@ -384,6 +384,25 @@ def config(app_version=None, device_id=None):
             order_by="flag_key asc",
         )
         flags = {r["flag_key"]: _flag_active_for_device(r, device_id, app_version) for r in rows}
+
+        # `premium_active` is PER-USER server truth, not a rollout flag: the
+        # client keys every Pro gate (HD, variations, custom rates, PDF quota,
+        # ad removal) off this. The endpoint is allow_guest, but the app sends
+        # its anon/session token, so frappe resolves the real caller here. A
+        # `premium_active` Feature Flag row, if present AND enabled, acts as a
+        # global QA override on top — never enable it in production.
+        try:
+            user = frappe.session.user
+            if user and user != "Guest":
+                from construction.construction.doctype.ai_settings import (
+                    ai_settings as _ai_cfg,
+                )
+                flags["premium_active"] = bool(flags.get("premium_active")) or _ai_cfg.is_premium(user)
+        except Exception:
+            # Entitlement lookup must never break config delivery; the client
+            # falls back to its cached/default (non-premium) value.
+            pass
+
         return {
             "flags": flags,
             "min_supported_version": "1.0.0",
@@ -1134,6 +1153,10 @@ def _ai_submit(tool_id, body, extra_payload):
     # breaks before we have IAP wired (PREM-3) and a way for users to top up.
     debit_key = None
     debit_result = None
+    # Zero-cost tools (floor plan) under credit gating, and every tool with
+    # gating off, stay bounded by the per-day free quota — otherwise flipping
+    # `credit_gating` on would silently uncap free floor-plan scans.
+    charge_free_quota = False
     if _credit_gating_enabled():
         cost = _credit_cost_for(tool_id, quality, variations)
         if cost > 0:
@@ -1159,7 +1182,12 @@ def _ai_submit(tool_id, body, extra_payload):
                         "topup_balance": state["topup_balance"],
                     },
                 )
+        else:
+            charge_free_quota = True
     else:
+        charge_free_quota = True
+
+    if charge_free_quota:
         ok, remaining = _free_quota_check(user, tool_id, cfg.get("free_daily_limit"))
         if not ok:
             return _error_response(
@@ -1213,7 +1241,7 @@ def _ai_submit(tool_id, body, extra_payload):
 
         frappe.db.commit()
 
-        if not _credit_gating_enabled():
+        if charge_free_quota:
             _free_quota_increment(user)
 
         frappe.enqueue(
@@ -1561,86 +1589,29 @@ def premium_status():
 
 @frappe.whitelist(methods=["POST"])
 def start_premium_trial(**kwargs):
-    """Grant the caller a 7-day premium trial. Idempotent — re-calling while
-    a trial is already active returns the existing entry; calling after a
-    prior trial expired returns TRIAL_USED."""
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    from datetime import timedelta
-    from frappe.utils import now_datetime
-    user = frappe.session.user
-    settings = frappe.get_doc("AI Settings")
-    now = now_datetime()
-    for row in (settings.get("premium_users") or []):
-        if row.user != user:
-            continue
-        if (row.note or "") != "trial":
-            continue
-        if not row.expires_at or row.expires_at > now:
-            return {
-                "premium": True,
-                "expires_at": str(row.expires_at) if row.expires_at else None,
-                "source": "trial",
-                "trial_used": True,
-                "already_active": True,
-            }
-        return _error_response(
-            "TRIAL_USED",
-            "You've already used your 7-day trial. Subscribe to keep premium features.",
-            409,
-        )
-    expires = now + timedelta(days=7)
-    settings.append("premium_users", {
-        "user": user,
-        "expires_at": expires,
-        "note": "trial",
-    })
-    settings.save(ignore_permissions=True)
-    frappe.db.commit()
-    return {
-        "premium": True,
-        "expires_at": str(expires),
-        "source": "trial",
-        "trial_used": True,
-        "already_active": False,
-    }
-
-
-@frappe.whitelist(methods=["POST"])
-def activate_premium(**kwargs):
-    """Activate or extend premium for the caller from a purchased receipt.
-
-    Body (JSON):
-        platform: "android" | "ios"
-        product_id: e.g. "buildcost_premium_monthly" | "buildcost_premium_annual"
-        receipt:    raw receipt string from Google Play / App Store
-        expires_at: ISO8601 datetime (client estimate; server is authoritative
-                    once real receipt validation is wired)
-
-    For v1 we trust the client's expiry — production-deploy step is to add a
-    Google Play Developer API / App Store Server API verify call here, then
-    overwrite expires_at with the verified value.
+    """REMOVED — Pro is paid-only, there is no free trial (product decision,
+    July 2026). Kept as a stub so old clients get a clean structured error
+    instead of a 404, and so the route can never silently grant premium again.
     """
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    body = _read_json_body() or {}
-    expires_raw = body.get("expires_at")
-    product_id = body.get("product_id") or "premium"
-    if not expires_raw:
-        return _error_response("MISSING_PARAMS", "expires_at is required", 400)
-    from frappe.utils import get_datetime, now_datetime
-    try:
-        expires = get_datetime(expires_raw)
-    except Exception:
-        return _error_response("INVALID_DATE", "expires_at must be ISO8601", 400)
-    if expires <= now_datetime():
-        return _error_response("EXPIRED", "expires_at is in the past", 400)
+    return _error_response(
+        "TRIAL_UNAVAILABLE",
+        "Free trials are no longer offered. Subscribe to unlock Pro.",
+        410,
+    )
 
-    user = frappe.session.user
+
+# Play Console subscription products. Mirror of the client's
+# IapProductIds.subscriptions — the server never trusts the client's claimed
+# product id (Play's line items are the truth), this set just bounds what we
+# accept at all.
+_SUBSCRIPTION_PRODUCTS = {
+    "buildcost_pro_monthly_v1",
+    "buildcost_pro_annual_v1",
+}
+
+
+def _upsert_premium_row(user, product_id, expires):
+    """Insert or update the (user, product_id) premium entry."""
     settings = frappe.get_doc("AI Settings")
     found = False
     for row in (settings.get("premium_users") or []):
@@ -1655,12 +1626,116 @@ def activate_premium(**kwargs):
             "note": product_id,
         })
     settings.save(ignore_permissions=True)
+
+
+@frappe.whitelist(methods=["POST"])
+def activate_premium(**kwargs):
+    """Activate or extend premium for the caller from a Play subscription
+    purchase token.
+
+    Body (JSON):
+        platform:   "android" (iOS not supported yet)
+        product_id: client-claimed product id (bounds-checked only; Play's
+                    line items are authoritative)
+        receipt:    the Play purchase token
+                    (PurchaseDetails.verificationData.serverVerificationData)
+
+    The expiry is ALWAYS derived server-side from the Play Developer API —
+    any client-sent `expires_at` is ignored. Fail-closed: when validation
+    isn't configured (see play_billing.py) and `play_billing_relaxed` is off,
+    this refuses with 503 rather than trusting the client.
+
+    Successful activation also seeds the current month's Pro credit grant
+    (idempotent per user+period), so a fresh subscriber can generate
+    immediately; renewals are topped up by the daily scheduler task.
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+    from construction.api import play_billing
+    from frappe.utils import now_datetime
+
+    body = _read_json_body() or {}
+    receipt = (body.get("receipt") or "").strip()
+    claimed_product = (body.get("product_id") or "").strip()
+    if not receipt:
+        return _error_response("MISSING_PARAMS", "receipt is required", 400)
+    if claimed_product and claimed_product not in _SUBSCRIPTION_PRODUCTS:
+        return _error_response(
+            "UNKNOWN_PRODUCT",
+            f"Subscription product {claimed_product!r} is not recognised",
+            400,
+        )
+
+    user = frappe.session.user
+
+    if play_billing.relaxed_mode():
+        # Local-QA escape hatch (play_billing_relaxed in site_config). Grants
+        # 31 days keyed on the claimed product. Never enable in production.
+        from datetime import timedelta
+        frappe.log_error(
+            f"activate_premium RELAXED grant for {user} ({claimed_product})",
+            "play_billing.relaxed",
+        )
+        product_id = claimed_product or "premium"
+        expires = now_datetime() + timedelta(days=31)
+    else:
+        try:
+            verified = play_billing.verify_subscription(receipt)
+        except play_billing.PlayBillingError as e:
+            return _error_response(e.code, e.message, e.http_status)
+        product_id = verified["product_id"] or claimed_product or "premium"
+        expires = verified["expires_at"]
+        if not verified["entitled"] or not expires or expires <= now_datetime():
+            return _error_response(
+                "RECEIPT_NOT_ACTIVE",
+                "This subscription is not active according to Google Play.",
+                400,
+                details={"state": verified["state"]},
+            )
+
+    _upsert_premium_row(user, product_id, expires)
+    # Seed this month's Pro credits so the subscriber isn't stuck on leftover
+    # welcome credits until the nightly scheduler runs. Idempotent per
+    # (user, period), so activate + scheduler can never double-grant.
+    try:
+        _grant_monthly_credits(user, reason=f"Pro activation: {product_id}")
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "activate_premium.monthly_grant")
     frappe.db.commit()
     return {
         "premium": True,
         "expires_at": str(expires),
         "source": product_id,
     }
+
+
+def grant_monthly_credits_for_active_pros():
+    """Daily scheduler task (hooks.py): top up the monthly credit bucket for
+    every user with an active, non-trial premium entry. Idempotent per
+    (user, period) via `_grant_monthly_credits`, so running daily just makes
+    each user's grant land on the first run of their billing month.
+    """
+    from frappe.utils import now_datetime
+
+    settings = ai_cfg.get_settings()
+    now = now_datetime()
+    seen = set()
+    for row in (settings.get("premium_users") or []):
+        if row.user in seen:
+            continue
+        if (row.note or "") == "trial":
+            continue
+        if row.expires_at and row.expires_at <= now:
+            continue
+        seen.add(row.user)
+        try:
+            _grant_monthly_credits(row.user, reason=f"Monthly Pro grant ({row.note or 'manual'})")
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "grant_monthly_credits_for_active_pros")
+    if seen:
+        frappe.db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -2492,10 +2567,10 @@ def anon_bootstrap(**kwargs):
 # server records the grant in the credit ledger keyed on a hash of the
 # receipt token so a retry can't double-credit.
 #
-# **TODO (AUTH-2 server tail):** actually validate `receipt_token` against
-# the Play Developer API before granting. Today the endpoint trusts the
-# client, which is fine for QA / dogfood with `iap_enabled` off in
-# production — DO NOT ship this without the validation in place.
+# AUTH-2 server tail: `receipt_token` is validated against the Play
+# Developer API (see play_billing.py) before any grant. Fail-closed when the
+# service account isn't configured; `play_billing_relaxed` in site_config is
+# the local-QA-only escape hatch.
 # ===========================================================================
 
 # Authoritative price list — what each Play Console product is worth in
@@ -2548,9 +2623,38 @@ def grant_topup_credits(**kwargs):
             400,
         )
 
-    # TODO(AUTH-2): replace this stub with a real Play Developer API call
-    # (`purchases.products.get`) that verifies the receipt is genuine and
-    # belongs to this device's obfuscatedAccountId before granting.
+    # AUTH-2: verify the token against the Play Developer API before granting.
+    # Fail-closed when validation isn't configured (unless the site opted into
+    # play_billing_relaxed for local QA) — an unverified string must never
+    # mint credits.
+    from construction.api import play_billing
+
+    if play_billing.relaxed_mode():
+        frappe.log_error(
+            f"grant_topup_credits RELAXED grant for {frappe.session.user} ({product_id})",
+            "play_billing.relaxed",
+        )
+    else:
+        try:
+            verified = play_billing.verify_product(receipt_token, product_id)
+        except play_billing.PlayBillingError as e:
+            return _error_response(e.code, e.message, e.http_status)
+        if verified["purchase_state"] == play_billing.PRODUCT_STATE_PENDING:
+            return _error_response(
+                "RECEIPT_PENDING",
+                "This purchase is still pending. Credits are granted once it completes.",
+                409,
+            )
+        if verified["purchase_state"] != play_billing.PRODUCT_STATE_PURCHASED:
+            return _error_response(
+                "RECEIPT_NOT_PURCHASED",
+                "This purchase is not in a purchased state according to Google Play.",
+                400,
+            )
+        # Prefer Play's order id for dedup — it's server-issued and stable
+        # across client retries even if the client mangles its own ids.
+        if verified.get("order_id"):
+            purchase_id = verified["order_id"]
 
     grant_amount = _TOPUP_GRANT_TABLE[product_id]
     dedup_key = _topup_dedup_key(product_id, receipt_token, purchase_id)

@@ -887,6 +887,10 @@ _TOOL_ALIASES = {
     "interior_design": "interior",
 }
 
+# C2: tools that support mode=text (design from imagination, no photo) and
+# mode=sketch (render a hand drawing). The editing tools need a real photo.
+_TEXT_MODE_TOOLS = {"interior", "exterior", "garden"}
+
 
 def _flag_enabled(key):
     enabled = frappe.db.get_value("Feature Flag", key, "enabled")
@@ -1025,10 +1029,66 @@ def _idempotency_key_from_request(data):
     return data.get("idempotency_key") if isinstance(data, dict) else None
 
 
+def _strip_image_metadata(content):
+    """Re-encode an uploaded image without EXIF/GPS metadata (A4).
+
+    Uploaded home photos routinely carry the GPS coordinates of the user's
+    home address in EXIF; that must never reach disk or a third-party vendor.
+    Re-encoding through Pillow drops every metadata block. Orientation is
+    baked into the pixels first so losing the Orientation tag can't rotate
+    the image. Fails CLOSED: content we can't parse and re-encode (HEIC,
+    decompression bombs, corrupt files) is rejected with an error-response
+    dict instead of passed through with its metadata intact (L1)."""
+    import io as _io
+    from PIL import Image, ImageOps
+
+    try:
+        img = Image.open(_io.BytesIO(content))
+        fmt = (img.format or "").upper()
+        if fmt not in ("JPEG", "PNG", "WEBP"):
+            return _error_response(
+                "UNSUPPORTED_IMAGE",
+                "Unsupported image format — please upload a JPEG, PNG, or WebP photo.",
+                400,
+            )
+        # Explicit pixel cap below PIL's ~179MP bomb threshold: a 10 MB PNG
+        # can decompress to hundreds of MB of RAM. 50MP clears every phone
+        # camera export while bounding the re-encode cost.
+        if img.width * img.height > 50_000_000:
+            return _error_response(
+                "IMAGE_TOO_LARGE",
+                "That image has too many pixels. Please upload a smaller photo.",
+                413,
+            )
+        img = ImageOps.exif_transpose(img)
+        out = _io.BytesIO()
+        if fmt == "JPEG":
+            img.convert("RGB").save(out, format="JPEG", quality=92)
+        elif fmt == "PNG":
+            img.save(out, format="PNG")
+        else:
+            img.save(out, format="WEBP", quality=92)
+        return out.getvalue()
+    except Image.DecompressionBombError:
+        return _error_response(
+            "IMAGE_TOO_LARGE",
+            "That image has too many pixels. Please upload a smaller photo.",
+            413,
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "v1.exif_strip_failed")
+        return _error_response(
+            "INVALID_IMAGE",
+            "We couldn't read that image. Please upload a JPEG, PNG, or WebP photo.",
+            400,
+        )
+
+
 def _save_uploaded_file(field_name):
     """If the request has a multipart file under [field_name], persist it as a
     private File and return its file_url. Returns None when absent, or a
-    forwarded error response dict when oversized."""
+    forwarded error response dict when oversized. EXIF/GPS metadata is
+    stripped before the bytes ever hit disk (A4)."""
     if not (frappe.request and frappe.request.files):
         return None
     upload = frappe.request.files.get(field_name)
@@ -1037,6 +1097,9 @@ def _save_uploaded_file(field_name):
     content = upload.read()
     if len(content) > 10 * 1024 * 1024:
         return _error_response("FILE_TOO_LARGE", "Image must be 10 MB or less", 413)
+    content = _strip_image_metadata(content)
+    if isinstance(content, dict):
+        return content
     from frappe.utils.file_manager import save_file
     file_doc = save_file(
         fname=upload.filename or f"ai_{field_name}.bin",
@@ -1046,6 +1109,71 @@ def _save_uploaded_file(field_name):
         is_private=1,
     )
     return file_doc.file_url
+
+
+_NOTES_SUBMIT_MAX_LEN = 300
+
+
+def _validate_notes(body):
+    """Submit-side guard on the free-text `notes` field (A2).
+
+    Over-long notes are truncated silently (friendlier than an error);
+    blocklisted notes are rejected outright BEFORE any credit is debited.
+    The worker re-sanitizes as defense-in-depth for legacy/replayed payloads."""
+    notes = body.get("notes")
+    if not notes:
+        return None
+    notes = str(notes)
+    if len(notes) > _NOTES_SUBMIT_MAX_LEN:
+        notes = notes[:_NOTES_SUBMIT_MAX_LEN]
+        body["notes"] = notes
+    from construction.api.ai_worker import notes_blocked_term
+    if notes_blocked_term(notes):
+        return _error_response(
+            "NOTES_REJECTED",
+            "Your notes contain content we can't process. "
+            "Please describe the design change you want and try again.",
+            400,
+        )
+    return None
+
+
+def _resolve_refine_source(body):
+    """C1 (multi-turn refine): resolve source_job_id/source_variation into the
+    prior result's private file URL, so the new run edits the AI's own output
+    instead of restarting from the original photo.
+
+    Premium-only: free-tier results carry a burned-in watermark, so refining
+    them would compound watermarks into the new image.
+
+    Returns a file_url string, None when no source_job_id given, or an error
+    response dict."""
+    job_id = body.get("source_job_id")
+    if not job_id:
+        return None
+    if not frappe.db.exists("AI Job", job_id):
+        return _error_response("NOT_FOUND", "Source job not found", 404)
+    job = frappe.get_doc("AI Job", job_id)
+    if job.user != frappe.session.user:
+        return _error_response("FORBIDDEN", "You do not own this job", 403)
+    if job.status != "succeeded":
+        return _error_response("NOT_READY", "Source job has not finished", 409)
+    if not ai_cfg.is_premium(frappe.session.user):
+        return _error_response(
+            "PREMIUM_REQUIRED", "Refining a result is a premium feature.", 402
+        )
+    result = json.loads(job.result_json or "null") or {}
+    images = result.get("images") or []
+    try:
+        idx = int(body.get("source_variation") or 0)
+    except (TypeError, ValueError):
+        idx = 0
+    if idx < 0 or idx >= len(images):
+        return _error_response("BAD_VARIATION", "source_variation out of range", 400)
+    url = (images[idx] or {}).get("url")
+    if not url:
+        return _error_response("NO_RESULT", "Source variation has no image", 422)
+    return url
 
 
 def _normalize_status(s):
@@ -1093,6 +1221,11 @@ def _ai_submit(tool_id, body, extra_payload):
             "This tool is available to premium users only.",
             402,
         )
+
+    # A2: cap/validate free-text notes before any debit or vendor spend.
+    notes_err = _validate_notes(body)
+    if notes_err is not None:
+        return notes_err
 
     quality = (body.get("quality") or "std").lower()
     if quality == "hd":
@@ -1295,7 +1428,9 @@ def ai_generate(**kwargs):
 
     Multipart body:
         tool_id      interior | exterior | garden | layout | cleanup | ref | paint | replace | floor
-        image        <file>         required for all 9
+        image        <file>         required (except mode=text / refine)
+        mode         photo | sketch | text   default photo (C2; text/sketch
+                                    are interior/exterior/garden only)
         style        <slug>         required
         room         <slug>         required iff tool_id == interior
         color        <slug>         optional
@@ -1319,11 +1454,37 @@ def ai_generate(**kwargs):
             400,
         )
 
-    image_url = _save_uploaded_file("image")
-    if isinstance(image_url, dict) and image_url.get("ok") is False:
-        return image_url
-    if not image_url:
-        return _error_response("MISSING_IMAGE", "A source image is required.", 400)
+    # C2: text (no source photo) and sketch (hand drawing → photoreal render)
+    # modes, for the three "design a space" tools only — the editing tools
+    # (mask/ref/paint/…) are meaningless without a real photo.
+    mode = (body.get("mode") or "photo").strip().lower()
+    if mode not in ("photo", "text", "sketch"):
+        mode = "photo"
+    if mode != "photo" and tool_id not in _TEXT_MODE_TOOLS:
+        return _error_response(
+            "MODE_UNSUPPORTED",
+            "Starting from text or a sketch is only available for interior, "
+            "exterior and garden designs.",
+            400,
+        )
+    body["mode"] = mode
+
+    image_url = None
+    if mode != "text":
+        image_url = _save_uploaded_file("image")
+        if isinstance(image_url, dict) and image_url.get("ok") is False:
+            return image_url
+        if not image_url and mode == "photo":
+            # C1: multi-turn refine — no fresh upload, edit a prior result
+            # image. Photo mode only: a refine source is an AI render, and
+            # feeding it through the sketch prompt ("this is a hand drawing")
+            # would degrade the result.
+            refined = _resolve_refine_source(body)
+            if isinstance(refined, dict) and refined.get("ok") is False:
+                return refined
+            image_url = refined
+        if not image_url:
+            return _error_response("MISSING_IMAGE", "A source image is required.", 400)
 
     extras = {"image_url": image_url}
     mask_url = _save_uploaded_file("mask")
@@ -1351,10 +1512,10 @@ def ai_floor_plan_analyze(**kwargs):
     image_url = _save_uploaded_file("image")
     if isinstance(image_url, dict) and image_url.get("ok") is False:
         return image_url
+    if not image_url:
+        return _error_response("MISSING_IMAGE", "A floor plan image is required.", 400)
 
-    extras = {}
-    if image_url:
-        extras["image_url"] = image_url
+    extras = {"image_url": image_url}
     if frappe.request and frappe.request.form:
         for key in ("city", "country", "quality_level"):
             val = frappe.request.form.get(key)
@@ -1441,38 +1602,29 @@ def ai_save_design(**kwargs):
     if job.status != "succeeded":
         return _error_response("NOT_READY", "Job has not finished successfully", 409)
 
-    result = json.loads(job.result_json or "null") or {}
-    images = result.get("images") or []
     try:
         idx = int(body.get("variation_index") or 0)
     except (TypeError, ValueError):
         idx = 0
-    if idx < 0 or idx >= len(images):
+
+    try:
+        return _upsert_design_for_job(
+            job,
+            variation_index=idx,
+            style=body.get("style"),
+            room=body.get("room"),
+            color=body.get("color"),
+            notes=body.get("notes"),
+        )
+    except ValueError as e:
+        if str(e) == "NO_RESULT":
+            return _error_response(
+                "NO_RESULT", "Selected variation has no image URL", 422
+            )
         return _error_response("BAD_VARIATION", "variation_index out of range", 400)
 
-    sel = images[idx] if isinstance(images[idx], dict) else {}
-    result_url = sel.get("url")
-    if not result_url:
-        return _error_response("NO_RESULT", "Selected variation has no image URL", 422)
 
-    req_payload = json.loads(job.request_payload_json or "{}")
-
-    design = frappe.new_doc("AI Design")
-    design.user = frappe.session.user
-    design.tool_id = job.job_type
-    design.job_id = job.name
-    design.style = body.get("style") or req_payload.get("style")
-    design.room = body.get("room") or req_payload.get("room")
-    design.color = body.get("color") or req_payload.get("color")
-    design.notes = body.get("notes") or req_payload.get("notes")
-    design.source_file = job.source_image_url
-    design.result_file = result_url
-    design.thumb_file = sel.get("thumb_url")
-    design.params_json = json.dumps({**req_payload, "variation_index": idx})
-    design.model = job.model
-    design.seed = str(sel.get("seed")) if sel.get("seed") is not None else None
-    design.insert(ignore_permissions=True)
-    frappe.db.commit()
+def _design_payload(design):
     return {
         "id": design.name,
         "result_file": design.result_file,
@@ -1483,6 +1635,58 @@ def ai_save_design(**kwargs):
         "color": design.color,
         "created_at": str(design.creation),
     }
+
+
+def _upsert_design_for_job(job, variation_index=0, style=None, room=None,
+                           color=None, notes=None):
+    """Create the AI Design row for (job, variation) if it doesn't exist yet.
+
+    Idempotent on (user, job_id, variation_index): the worker auto-saves
+    variation 0 on every success (so a result reaches My Designs even when no
+    client is watching — killed app, client poll timeout, backgrounded
+    compare), and the client's explicit save lands on the same row instead of
+    duplicating it.
+
+    Raises ValueError("BAD_VARIATION"|"NO_RESULT") for unusable input;
+    commits on insert.
+    """
+    result = json.loads(job.result_json or "null") or {}
+    images = result.get("images") or []
+    if variation_index < 0 or variation_index >= len(images):
+        raise ValueError("BAD_VARIATION")
+    sel = images[variation_index] if isinstance(images[variation_index], dict) else {}
+    result_url = sel.get("url")
+    if not result_url:
+        raise ValueError("NO_RESULT")
+
+    existing = frappe.db.get_value(
+        "AI Design",
+        {"user": job.user, "job_id": job.name, "variation_index": variation_index},
+        "name",
+    )
+    if existing:
+        return _design_payload(frappe.get_doc("AI Design", existing))
+
+    req_payload = json.loads(job.request_payload_json or "{}")
+
+    design = frappe.new_doc("AI Design")
+    design.user = job.user
+    design.tool_id = job.job_type
+    design.job_id = job.name
+    design.variation_index = variation_index
+    design.style = style or req_payload.get("style")
+    design.room = room or req_payload.get("room")
+    design.color = color or req_payload.get("color")
+    design.notes = notes or req_payload.get("notes")
+    design.source_file = job.source_image_url
+    design.result_file = result_url
+    design.thumb_file = sel.get("thumb_url")
+    design.params_json = json.dumps({**req_payload, "variation_index": variation_index})
+    design.model = job.model
+    design.seed = str(sel.get("seed")) if sel.get("seed") is not None else None
+    design.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return _design_payload(design)
 
 
 @frappe.whitelist()
@@ -1533,6 +1737,240 @@ def delete_ai_design(id=None, **kwargs):
     return {"deleted": id}
 
 
+@frappe.whitelist(methods=["POST"])
+def ai_feedback(**kwargs):
+    """Record a thumbs up/down on a generated result (C3).
+
+    Body (JSON or form):
+        job_id       required, must be owned by caller
+        rating       "up" | "down"   required
+        reason       optional short free text (capped at 300 chars)
+        image_index  optional int 0..3 (which variation), default 0
+
+    Upserts on (user, job_id, image_index) so tapping up then down flips the
+    rating instead of double-counting.
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+
+    body = _read_json_body() or {}
+    if not body and frappe.request and frappe.request.form:
+        body = dict(frappe.request.form)
+
+    job_id = body.get("job_id")
+    rating = (body.get("rating") or "").lower()
+    if not job_id or rating not in ("up", "down"):
+        return _error_response(
+            "MISSING_PARAMS", "job_id and rating (up|down) are required", 400
+        )
+
+    if not frappe.db.exists("AI Job", job_id):
+        return _error_response("NOT_FOUND", "Job not found", 404)
+    job = frappe.get_doc("AI Job", job_id)
+    if job.user != frappe.session.user:
+        return _error_response("FORBIDDEN", "You do not own this job", 403)
+
+    try:
+        image_index = max(0, min(3, int(body.get("image_index") or 0)))
+    except (TypeError, ValueError):
+        image_index = 0
+    reason = str(body.get("reason") or "").strip()[:300] or None
+
+    req_payload = json.loads(job.request_payload_json or "{}")
+
+    existing = frappe.db.get_value(
+        "AI Feedback",
+        {"user": frappe.session.user, "job_id": job_id, "image_index": image_index},
+        "name",
+    )
+    if existing:
+        fb = frappe.get_doc("AI Feedback", existing)
+    else:
+        fb = frappe.new_doc("AI Feedback")
+        fb.user = frappe.session.user
+        fb.job_id = job_id
+        fb.image_index = image_index
+    fb.tool_id = job.job_type
+    fb.rating = rating
+    fb.reason = reason
+    fb.model = job.model
+    fb.style = req_payload.get("style")
+    fb.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"id": fb.name, "rating": fb.rating}
+
+
+# ============================================================================
+# Data governance (E1): retention + user-initiated deletion of source photos
+# ============================================================================
+#
+# Source photos (users' actual homes: address hints, valuables, family
+# members) are more sensitive than generated results. Results are kept
+# indefinitely (V1 Q9); source uploads are deleted after AI_SOURCE_RETENTION_
+# DAYS unless the user saved a design that still references them (the
+# before/after slider needs the original), and can be purged on demand via
+# delete_my_ai_photos.
+
+AI_SOURCE_RETENTION_DAYS = 30
+
+
+def _delete_private_file(file_url):
+    """Delete every File row (and its disk content) matching file_url.
+    Returns how many rows were deleted."""
+    if not file_url:
+        return 0
+    deleted = 0
+    for row in frappe.get_all("File", filters={"file_url": file_url}, pluck="name"):
+        try:
+            frappe.delete_doc("File", row, ignore_permissions=True, force=True)
+            deleted += 1
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "v1.ai_photo_delete_failed")
+    return deleted
+
+
+def cleanup_ai_source_uploads():
+    """Scheduled daily (hooks.py): enforce the source-photo retention window.
+
+    Deletes source/mask/ref uploads on terminal AI Jobs older than
+    AI_SOURCE_RETENTION_DAYS, except files still referenced by a saved
+    AI Design. Clears the URL fields on the job so re-runs skip it. Bounded
+    per run so a large backlog can't stall the scheduler."""
+    from frappe.utils import add_days, now_datetime
+
+    cutoff = add_days(now_datetime(), -AI_SOURCE_RETENTION_DAYS)
+    kept = {
+        r
+        for r in frappe.get_all("AI Design", pluck="source_file", limit_page_length=0)
+        if r
+    }
+    jobs = frappe.get_all(
+        "AI Job",
+        filters={
+            "creation": ["<", cutoff],
+            "status": ["in", ["succeeded", "failed"]],
+        },
+        or_filters=[
+            ["source_image_url", "!=", ""],
+            ["mask_url", "!=", ""],
+            ["ref_image_url", "!=", ""],
+        ],
+        fields=["name", "source_image_url", "mask_url", "ref_image_url"],
+        limit_page_length=500,
+    )
+    removed = 0
+    for job in jobs:
+        for field in ("source_image_url", "mask_url", "ref_image_url"):
+            url = job.get(field)
+            if url and url not in kept:
+                removed += _delete_private_file(url)
+            if url:
+                frappe.db.set_value("AI Job", job["name"], field, "", update_modified=False)
+    if jobs:
+        frappe.db.commit()
+    return {"jobs_scanned": len(jobs), "files_deleted": removed}
+
+
+# Jobs still queued/running this long after their last touch are dead: the
+# RQ hard-kill window is 10 minutes, so past this the worker can no longer
+# flip them to failed and the user's credits would be stranded forever.
+_STALE_JOB_MINUTES = 30
+
+
+def cleanup_stale_ai_jobs():
+    """Scheduled hourly (hooks.py): fail out AI Jobs stuck in queued/running.
+
+    An RQ timeout or a SIGKILL'ed worker leaves the job doc non-terminal
+    forever — run_job's exception handling never fires, so the refund path
+    never runs and the ops report undercounts failures. Mark anything stale
+    as failed with a user-safe message and run the standard idempotent
+    refund. Deliberately does NOT feed the circuit breaker: a stale job says
+    nothing about *current* vendor health."""
+    from frappe.utils import add_to_date, now_datetime
+
+    cutoff = add_to_date(now_datetime(), minutes=-_STALE_JOB_MINUTES)
+    rows = frappe.get_all(
+        "AI Job",
+        filters={
+            "status": ["in", ["queued", "running"]],
+            "modified": ["<", cutoff],
+        },
+        pluck="name",
+        limit_page_length=200,
+    )
+    failed_out = 0
+    for name in rows:
+        try:
+            doc = frappe.get_doc("AI Job", name)
+            if doc.status not in ("queued", "running"):
+                continue
+            doc.status = "failed"
+            doc.error_code = "WORKER_ERROR"
+            doc.error_message = (
+                "This job was interrupted on our side. "
+                "Your credits have been refunded — please try again."
+            )
+            doc.completed_at = now_datetime()
+            doc.save(ignore_permissions=True)
+            if _credit_gating_enabled():
+                _refund_credits(
+                    doc.user,
+                    ref_doctype="AI Job",
+                    ref_name=doc.name,
+                    reason="AI job stale/interrupted (watchdog)",
+                )
+            failed_out += 1
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "v1.cleanup_stale_ai_jobs")
+    if failed_out:
+        frappe.db.commit()
+    return {"jobs_failed_out": failed_out}
+
+
+@frappe.whitelist(methods=["POST"])
+def delete_my_ai_photos(**kwargs):
+    """User-initiated purge of every photo the caller ever uploaded to the AI
+    tools (E1) — source, mask, and reference files on their AI Jobs, plus the
+    source files retained by their saved designs. Generated results are kept."""
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+
+    user = frappe.session.user
+    removed = 0
+
+    jobs = frappe.get_all(
+        "AI Job",
+        filters={"user": user},
+        fields=["name", "source_image_url", "mask_url", "ref_image_url"],
+        limit_page_length=0,
+    )
+    for job in jobs:
+        for field in ("source_image_url", "mask_url", "ref_image_url"):
+            url = job.get(field)
+            if url:
+                removed += _delete_private_file(url)
+                frappe.db.set_value("AI Job", job["name"], field, "", update_modified=False)
+
+    designs = frappe.get_all(
+        "AI Design",
+        filters={"user": user},
+        fields=["name", "source_file"],
+        limit_page_length=0,
+    )
+    for design in designs:
+        url = design.get("source_file")
+        if url:
+            removed += _delete_private_file(url)
+            frappe.db.set_value("AI Design", design["name"], "source_file", "", update_modified=False)
+
+    frappe.db.commit()
+    return {"files_deleted": removed}
+
+
 @frappe.whitelist()
 def ai_quota_status():
     """Returns the caller's remaining free generations today + premium status."""
@@ -1551,6 +1989,70 @@ def ai_quota_status():
     free_limit = int(cfg.get("free_daily_limit") or 0)
     remaining = max(0, free_limit - used) if free_limit else -1
     return {"premium": False, "remaining_today": remaining, "free_daily_limit": free_limit}
+
+
+# C7: tools whose per-unit rate is honest without knowing the room's area —
+# the unit itself is per sq ft, so area cancels out. Everything else returns
+# an empty hint list (fabricating a total for a photo would undermine the
+# estimator's credibility).
+_COST_HINT_TOOLS = {"floor", "paint"}
+
+
+@frappe.whitelist()
+def ai_cost_hint(tool_id=None, country=None):
+    """C7: per-unit material rate tags for an image-edit result.
+
+    Reads the same Construction Setting rate table the PK estimator uses, so
+    the numbers on the AI result screen and in a full estimate can never
+    disagree. Rates left at 0/unset are omitted; an empty `hints` list tells
+    the client to hide the tag entirely.
+
+    The rates are Pakistan-market (Construction Setting is the PK table) —
+    the note labels them as such, and a client that knows its user is in
+    another market can pass `country` to suppress the tag entirely.
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+
+    tool_id = _resolve_tool_id(tool_id)
+    empty = {"tool_id": tool_id, "currency": "PKR", "unit": "sq ft", "hints": []}
+    if tool_id not in _COST_HINT_TOOLS:
+        return empty
+    if country and str(country).strip().upper() not in ("PK", "PAKISTAN"):
+        return empty
+    try:
+        settings = frappe.get_single("Construction Setting")
+    except Exception:
+        return empty
+
+    hints = []
+
+    def _add(label, rate):
+        try:
+            rate = float(rate or 0)
+        except (TypeError, ValueError):
+            return
+        if rate > 0:
+            hints.append({"label": label, "rate": round(rate, 2)})
+
+    if tool_id == "floor":
+        _add("Marble", getattr(settings, "marble_rate", 0))
+        _add("Tile", getattr(settings, "tile_rate", 0))
+        _add("Laying labour", getattr(settings, "floor_labour_rate", 0))
+    elif tool_id == "paint":
+        _add("Paint incl. labour", getattr(settings, "paint_with_lab_rate", 0))
+        _add("Simple paint incl. labour",
+             getattr(settings, "simple_paint_with_lab_rate", 0))
+
+    return {
+        "tool_id": tool_id,
+        "currency": "PKR",
+        "unit": "sq ft",
+        "hints": hints,
+        "note": "Pakistan market rates from your estimator — not a full quote.",
+    }
 
 
 # ============================================================================
@@ -2373,6 +2875,85 @@ def credits_balance():
     except Exception:
         corr = _log_unhandled("v1.credits_balance")
         return _error_response("SERVER_ERROR", "Failed to load credits", 500, correlation_id=corr)
+
+
+# ============================================================================
+# G1/G2 — reward credits (rewarded ad, share-to-earn)
+# ============================================================================
+#
+# Both grant +1 topup credit, hard-capped at one per user per day by the
+# ledger's idempotency key ({prefix}:{user}:{date}) — the dedupe is native to
+# _insert_ledger_event, so replays and double-taps are free no-ops. Flag-gated
+# so either lever can be shut off server-side without a release.
+#
+# G1 ships without AdMob server-side verification (SSV): the flag + the daily
+# cap + the global budget kill switch bound the abuse. SSV is the hardening
+# follow-up once a real rewarded unit id exists.
+
+_REWARD_CREDIT_AMOUNT = 1
+
+
+def _claim_daily_reward(flag_key, event_prefix, reason):
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+    if not _flag_enabled(flag_key) or not _credit_gating_enabled():
+        return _error_response(
+            "REWARD_DISABLED", "This reward is not available right now.", 403
+        )
+    user = frappe.session.user
+    from frappe.utils import nowdate
+    key = f"{event_prefix}:{user}:{nowdate()}"
+    try:
+        if frappe.db.get_value("AI Credit Ledger", {"idempotency_key": key}, "name"):
+            state = _get_credit_state(user)
+            return {
+                "granted": False,
+                "reason": "DAILY_LIMIT",
+                "amount": 0,
+                "balance": state["total_balance"],
+            }
+        try:
+            balance = _insert_ledger_event(
+                user,
+                event_type="grant_reward",
+                bucket="topup",
+                delta=_REWARD_CREDIT_AMOUNT,
+                reason=reason,
+                idempotency_key=key,
+            )
+        except (frappe.DuplicateEntryError, frappe.UniqueValidationError):
+            # Two concurrent claims raced past the pre-check; the unique index
+            # on idempotency_key stopped the second insert. That's the daily
+            # cap doing its job — report it as such, not as a server error.
+            frappe.db.rollback()
+            state = _get_credit_state(user)
+            return {
+                "granted": False,
+                "reason": "DAILY_LIMIT",
+                "amount": 0,
+                "balance": state["total_balance"],
+            }
+        frappe.db.commit()
+        return {"granted": True, "amount": _REWARD_CREDIT_AMOUNT, "balance": balance}
+    except Exception:
+        corr = _log_unhandled(f"v1.{event_prefix}")
+        return _error_response(
+            "SERVER_ERROR", "Could not grant the reward.", 500, correlation_id=corr
+        )
+
+
+@frappe.whitelist(methods=["POST"])
+def ad_reward(**kwargs):
+    """G1: +1 topup credit for completing a rewarded ad. 1/user/day."""
+    return _claim_daily_reward("rewarded_ads", "ad_reward", "Rewarded ad bonus credit")
+
+
+@frappe.whitelist(methods=["POST"])
+def share_reward(**kwargs):
+    """G2: +1 topup credit after sharing a generated design. 1/user/day."""
+    return _claim_daily_reward("share_rewards", "share_reward", "Share-to-earn bonus credit")
 
 
 @frappe.whitelist(methods=["POST"])

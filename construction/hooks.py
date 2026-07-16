@@ -145,10 +145,26 @@ fixtures = [
 # ---------------
 
 scheduler_events = {
+    "hourly": [
+        # Watchdog: fail out AI Jobs stuck in queued/running past the RQ
+        # hard-kill window and refund their credits (idempotent).
+        "construction.api.v1.cleanup_stale_ai_jobs",
+    ],
     "daily": [
         # Monthly Pro credit top-ups (idempotent per user+period, so daily
         # runs just make each grant land on the first run of the month).
         "construction.api.v1.grant_monthly_credits_for_active_pros",
+        # B4: config-drift smoke test — alert if any enabled AI tool has
+        # silently reverted to the mock vendor or lost its API key.
+        "construction.construction.doctype.ai_settings.ai_settings.verify_live_tool_configs",
+        # E1: retention window for uploaded source photos (privacy) — deletes
+        # source/mask/ref uploads on old terminal jobs, keeps saved designs.
+        "construction.api.v1.cleanup_ai_source_uploads",
+    ],
+    "weekly": [
+        # B5: golden-pair drift checks. No-ops unless site_config sets
+        # `ai_golden_weekly: 1` — each run spends real vendor budget.
+        "construction.api.ai_golden.run_weekly",
     ],
 }
 

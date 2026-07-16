@@ -6,7 +6,8 @@
 #              -> default: mock (returns a deterministic stock image).
 #                 Flip the row's vendor to "gemini" + model
 #                 "gemini-2.5-flash-image" once a Gemini key is set on
-#                 AI Settings.
+#                 AI Settings. "fal" (FLUX Kontext) is wired as a fallback
+#                 vendor — set the row's vendor to "fal" + a fal model id.
 #
 # Each vendor adapter MUST set:
 #   doc.model, doc.tokens_input, doc.tokens_output, doc.cost_cents
@@ -14,10 +15,29 @@
 #   floor_plan: {"ai_result": {...}, "estimate": null}
 #   image-edit: {"images": [{"url", "thumb_url", "seed"}, ...], "prompt"}
 # cost_cents drives budget enforcement in v1._check_budgets.
+#
+# Error taxonomy (F2) — doc.error_code on failed jobs. error_message is always
+# user-safe; technical detail goes to the Error Log via _VendorError.detail:
+#   SAFETY_BLOCKED       vendor refused the content for safety (A3) — user must
+#                        change photo/notes; NOT retryable, NOT a vendor outage.
+#   MODERATION_REJECTED  our pre-flight gate rejected the source photo (A1).
+#   VENDOR_RATE_LIMITED  vendor 429 after retries — transient.
+#   VENDOR_UNAVAILABLE   vendor 5xx after retries — transient outage.
+#   VENDOR_TIMEOUT       vendor request timed out after retries — transient.
+#   VENDOR_NETWORK       connection-level failure after retries — transient.
+#   VENDOR_HTTP          non-retryable vendor 4xx (bad key, bad request).
+#   VENDOR_RESPONSE      2xx but malformed/unusable payload.
+#   VENDOR_UNSUPPORTED   requested capability not available on this vendor.
+#   FILE_MISSING         uploaded source file could not be read back.
+#   AI_DISABLED          vendor/tool disabled or key missing.
+#   WORKER_ERROR         unhandled exception — see Error Log.
+# Transient codes feed the error-rate circuit breaker (B3): repeated vendor
+# failures inside a short window auto-trip the kill switch.
 
 import base64
 import io
 import json
+import re
 import time
 import traceback
 
@@ -54,6 +74,7 @@ def run_job(name):
 
         doc.result_json = json.dumps(result)
         doc.status = "succeeded"
+        _circuit_note_success(tool_id)
     except _AIDisabled as e:
         doc.error_code = "AI_DISABLED"
         doc.error_message = str(e)
@@ -62,14 +83,34 @@ def run_job(name):
         doc.error_code = e.code
         doc.error_message = str(e)
         doc.status = "failed"
+        if e.detail:
+            frappe.log_error(e.detail, f"ai_worker.vendor:{e.code}:{name}")
+        _circuit_note_failure(doc.job_type, e.code)
     except Exception:
         frappe.log_error(traceback.format_exc(), f"ai_worker.run:{name}")
         doc.error_code = "WORKER_ERROR"
-        doc.error_message = "Worker failed - see error log"
+        doc.error_message = "Something went wrong on our side. Please try again."
         doc.status = "failed"
+        _circuit_note_failure(doc.job_type, "WORKER_ERROR")
 
     doc.completed_at = now_datetime()
     doc.save(ignore_permissions=True)
+
+    # Successful image jobs persist their first variation as an AI Design
+    # server-side, so a paid result reaches My Designs even when no client is
+    # watching (killed app, client poll timeout, backgrounded compare). Done
+    # BEFORE the status commit so a client that sees "succeeded" is
+    # guaranteed to find the row and its own save upserts instead of racing a
+    # duplicate. Best-effort: a save hiccup must never fail a succeeded job.
+    if doc.status == "succeeded" and doc.job_type in _IMAGE_EDIT_TOOLS:
+        try:
+            from construction.api.v1 import _upsert_design_for_job
+            _upsert_design_for_job(doc, variation_index=0)
+        except Exception:
+            frappe.log_error(
+                traceback.format_exc(), f"ai_worker.autosave:{name}"
+            )
+
     frappe.db.commit()
 
     # PREM-4: failed jobs auto-refund the credits that were debited at submit
@@ -97,15 +138,375 @@ class _AIDisabled(Exception):
 
 
 class _VendorError(Exception):
-    def __init__(self, code, message):
+    """User-facing vendor failure.
+
+    `message` is safe to show in the app verbatim; `detail` carries the
+    technical payload (status codes, response bodies) and is only written to
+    the server Error Log — never to doc.error_message (F2)."""
+
+    def __init__(self, code, message, detail=None):
         super().__init__(message)
         self.code = code
+        self.detail = detail
 
 
 _IMAGE_EDIT_TOOLS = {
     "interior", "exterior", "garden", "layout",
     "cleanup", "ref", "paint", "replace", "floor",
 }
+
+# C2: generation modes for the image-edit tools. "photo" edits an uploaded
+# photo (the default), "sketch" renders an uploaded hand-drawn sketch
+# photorealistically, "text" creates from imagination with no source image at
+# all. v1.ai_generate restricts text/sketch to interior/exterior/garden.
+_GENERATE_MODES = {"photo", "text", "sketch"}
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker (B3) — auto-trip the kill switch on elevated vendor error
+# rate, not just on budget. Counter lives in the site cache with a sliding
+# expiry; content-level failures (safety, moderation) don't count because they
+# say nothing about vendor health.
+# ---------------------------------------------------------------------------
+
+_CB_WINDOW_SEC = 600
+_CB_THRESHOLD = 6
+_CB_TRIP_HOURS = 0.5
+
+_CB_COUNTED_CODES = {
+    "VENDOR_NETWORK", "VENDOR_TIMEOUT", "VENDOR_RATE_LIMITED",
+    "VENDOR_UNAVAILABLE", "VENDOR_HTTP", "VENDOR_RESPONSE", "WORKER_ERROR",
+}
+
+
+def _circuit_note_failure(tool_id, code):
+    if code not in _CB_COUNTED_CODES:
+        return
+    try:
+        cache = frappe.cache()
+        key = f"ai_cb:{tool_id}"
+        current = int(cache.get_value(key) or 0) + 1
+        cache.set_value(key, current, expires_in_sec=_CB_WINDOW_SEC)
+        if current >= _CB_THRESHOLD:
+            ai_cfg.trip_kill_switch(
+                hours=_CB_TRIP_HOURS,
+                reason=(
+                    f"Circuit breaker: {current} vendor failures for "
+                    f"{tool_id} within {_CB_WINDOW_SEC // 60} min "
+                    f"(last: {code})"
+                ),
+            )
+            cache.delete_value(key)
+    except Exception:
+        frappe.log_error(traceback.format_exc(), "ai_worker.circuit_breaker")
+
+
+def _circuit_note_success(tool_id):
+    try:
+        frappe.cache().delete_value(f"ai_cb:{tool_id}")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers — retry-with-backoff on transient vendor failures (B1)
+# ---------------------------------------------------------------------------
+
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+_VENDOR_USER_MESSAGES = {
+    "VENDOR_RATE_LIMITED": "The AI service is busy right now. Please try again in a minute.",
+    "VENDOR_UNAVAILABLE": "The AI service is temporarily unavailable. Please try again shortly.",
+    "VENDOR_TIMEOUT": "The AI service took too long to respond. Please try again.",
+    "VENDOR_NETWORK": "Could not reach the AI service. Please check back shortly.",
+    "VENDOR_HTTP": "The AI service could not process this request. Please try again.",
+    "VENDOR_RESPONSE": "The AI returned an unexpected result. Please try again.",
+}
+
+
+def _http_error(status, vendor, body_snippet):
+    if status == 429:
+        code = "VENDOR_RATE_LIMITED"
+    elif status >= 500:
+        code = "VENDOR_UNAVAILABLE"
+    else:
+        code = "VENDOR_HTTP"
+    return _VendorError(
+        code,
+        _VENDOR_USER_MESSAGES[code],
+        detail=f"{vendor} returned {status}: {body_snippet}",
+    )
+
+
+def _post_json_with_retry(url, body, timeout, vendor, retries=2, headers=None):
+    """POST returning the 200 Response; retries timeouts/429/5xx with a short
+    backoff, fails fast on non-retryable 4xx (B1)."""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(url, json=body, timeout=timeout, headers=headers or None)
+        except requests.Timeout as e:
+            last_err = _VendorError(
+                "VENDOR_TIMEOUT", _VENDOR_USER_MESSAGES["VENDOR_TIMEOUT"],
+                detail=f"{vendor} timeout: {e}",
+            )
+        except requests.RequestException as e:
+            last_err = _VendorError(
+                "VENDOR_NETWORK", _VENDOR_USER_MESSAGES["VENDOR_NETWORK"],
+                detail=f"{vendor} request failed: {e}",
+            )
+        else:
+            if resp.status_code == 200:
+                return resp
+            last_err = _http_error(resp.status_code, vendor, resp.text[:300])
+            if resp.status_code not in _RETRYABLE_STATUS:
+                raise last_err
+        if attempt < retries:
+            time.sleep(1.5 * (attempt + 1))
+    raise last_err
+
+
+# ---------------------------------------------------------------------------
+# Gemini safety handling (A3) — a safety refusal is a distinct, user-facing
+# outcome, not a generic VENDOR_RESPONSE.
+# ---------------------------------------------------------------------------
+
+_SAFETY_FINISH_REASONS = {
+    "SAFETY", "PROHIBITED_CONTENT", "IMAGE_SAFETY", "BLOCKLIST", "SPII",
+}
+
+_SAFETY_USER_MESSAGE = (
+    "This photo or request couldn't be processed. "
+    "Try a different photo or simpler notes."
+)
+
+
+def _check_gemini_safety(data):
+    """Raise SAFETY_BLOCKED when Gemini refused the prompt or the response."""
+    fb = (data or {}).get("promptFeedback") or {}
+    if fb.get("blockReason"):
+        raise _VendorError(
+            "SAFETY_BLOCKED", _SAFETY_USER_MESSAGE,
+            detail=f"Gemini promptFeedback.blockReason={fb.get('blockReason')}",
+        )
+    for cand in (data or {}).get("candidates") or []:
+        reason = (cand.get("finishReason") or "").upper()
+        if reason in _SAFETY_FINISH_REASONS:
+            raise _VendorError(
+                "SAFETY_BLOCKED", _SAFETY_USER_MESSAGE,
+                detail=f"Gemini finishReason={reason}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Free-text sanitization (A2) — notes/style/room/color are user input that is
+# concatenated into the vendor prompt. Submit-side validation in v1 rejects
+# blocklisted notes before any credit is debited; this is defense-in-depth for
+# payloads that reach the worker via other paths (legacy endpoints, replays).
+# ---------------------------------------------------------------------------
+
+_NOTES_MAX_LEN = 300
+_SLUG_MAX_LEN = 60
+
+# Substring match, lowercased. Injection phrases + clearly-abusive content.
+# Deliberately short: the vendor safety filter (A3) is the real backstop.
+NOTES_BLOCKLIST = (
+    "ignore previous", "ignore all previous", "ignore the above",
+    "disregard previous", "disregard the above", "system prompt",
+    "you are now", "new instructions", "jailbreak", "do anything now",
+    "nsfw", "nude", "naked", "topless", "undress", "porn", "sexual",
+    "erotic", "xxx", "gore", "beheading", "corpse", "mutilat",
+)
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def notes_blocked_term(text):
+    """Return the first blocklisted term found in text, else None."""
+    low = (text or "").lower()
+    for term in NOTES_BLOCKLIST:
+        if term in low:
+            return term
+    return None
+
+
+def _clean_prompt_field(value, max_len):
+    """Strip control chars, collapse whitespace, hard-cap length."""
+    if not value:
+        return None
+    text = _CONTROL_CHARS_RE.sub(" ", str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_len] or None
+
+
+# H2: expand client style slugs into rich prompt phrases. Pakistan-first
+# entries name real, locally available materials so a render maps to things a
+# local builder can actually buy — keep in sync with AiCatalog.styles in the
+# Flutter app (lib/features/ai/data/ai_catalog.dart).
+_STYLE_PHRASES = {
+    # interior
+    "modern": "modern (clean lines, neutral palette)",
+    "minimal": "minimalist (whites, soft natural wood)",
+    "industrial": "industrial (exposed concrete, matte black metal)",
+    "scandi": "Scandinavian (light wood, soft textiles)",
+    "classic": "classic (warm wood, traditional ornament)",
+    "boho": "bohemian (layered textiles, plants)",
+    "japandi": "Japandi (quiet, handmade, low furniture)",
+    "heritage": (
+        "traditional Pakistani heritage (carved sheesham wood furniture, "
+        "jharoka-style arches, brass accents, handwoven rugs)"
+    ),
+    "lux": "luxury (marble surfaces, brass details)",
+    # exterior
+    "mediterranean": "Mediterranean (stucco walls, terracotta roof)",
+    "colonial": "colonial (symmetric facade, columns)",
+    "desi": (
+        "Pakistani brick (warm gutka brick facade, jali screens, "
+        "cantilever shades)"
+    ),
+    "gwalior": (
+        "local stone facade (beige sandstone cladding, grey granite trim, "
+        "minimal glazing)"
+    ),
+    "farmhouse": "farmhouse (pitched roof, porch, natural materials)",
+    "contemp": "contemporary (mixed materials, bold massing)",
+    # garden
+    "tropical": "tropical (lush dense planting)",
+    "desert": "desert (drought-friendly stone and succulents)",
+    "english": "English cottage (perennial borders)",
+    "zen": "zen (raked gravel, sculpted shrubs)",
+    "charbagh": (
+        "Mughal charbagh (symmetric quadrant lawns, central water channel, "
+        "cypress and citrus planting)"
+    ),
+    "modernlh": "modern lawn (geometric beds, clean hardscape)",
+    "edible": "edible garden (vegetable beds, fruit trees)",
+}
+
+
+_ROOM_PHRASES = {
+    "living": "living room",
+    "bedroom": "bedroom",
+    "kitchen": "kitchen",
+    "dining": "dining room",
+    "bath": "bathroom",
+    "office": "home office",
+    "kids": "kids room",
+    "lounge": "lounge",
+}
+
+
+def _sanitize_prompt_inputs(payload):
+    """Sanitized {style, room, color, notes} for the prompt builders (A2),
+    with style/room slugs expanded to readable prompt phrases (H2).
+
+    Blocklisted notes are dropped entirely rather than partially scrubbed —
+    a scrubbed injection attempt is still an injection attempt."""
+    notes = _clean_prompt_field(payload.get("notes"), _NOTES_MAX_LEN)
+    if notes and notes_blocked_term(notes):
+        notes = None
+    style = _clean_prompt_field(payload.get("style"), _SLUG_MAX_LEN)
+    if style:
+        style = _STYLE_PHRASES.get(style.lower(), style)
+    room = _clean_prompt_field(payload.get("room"), _SLUG_MAX_LEN)
+    if room:
+        room = _ROOM_PHRASES.get(room.lower(), room)
+    return {
+        "style": style,
+        "room": room,
+        "color": _clean_prompt_field(payload.get("color"), _SLUG_MAX_LEN),
+        "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Input moderation (A1) — cheap Gemini vision gate on the source photo before
+# the expensive generation call. Fails CLOSED on an explicit unsafe/mismatch
+# verdict, fails OPEN on infrastructure hiccups (a moderation outage must not
+# take the whole product down; the vendor's own safety filter still applies).
+# ---------------------------------------------------------------------------
+
+_MODERATION_MODEL = "gemini-2.0-flash"
+
+_MODERATION_PROMPT = (
+    "You are a strict content gate for a home-design app. Classify the image. "
+    "Reply ONLY with this JSON: "
+    '{"category": one of ["home_interior","home_exterior","garden_outdoor",'
+    '"floor_plan","other"], "safe": true|false}. '
+    'Set "safe" to false for nudity or sexual content, graphic violence, '
+    "or imagery of identifiable people as the main subject. "
+    'Rooms, buildings, gardens and architectural drawings are "safe": true.'
+)
+
+_MODERATION_ALLOWED = {
+    "floor_plan": {"floor_plan"},
+    # Every image-edit tool accepts any home-ish scene.
+    "_image_edit": {"home_interior", "home_exterior", "garden_outdoor"},
+}
+
+_MODERATION_REJECT_MESSAGE = (
+    "This doesn't look like a photo of a room, building, garden or floor "
+    "plan. Please upload a photo of your space."
+)
+
+_MODERATION_UNSAFE_MESSAGE = (
+    "This photo can't be processed. Please upload a photo of a room, "
+    "building, garden or floor plan."
+)
+
+
+def _moderate_source_image(tool_id, image_bytes, mime, allow_any_category=False):
+    """Gate the uploaded photo (A1). Returns the moderation token usage dict
+    (or None when skipped) so callers can fold it into the job's totals.
+
+    `allow_any_category` (C2 sketch mode): hand-drawn sketches classify
+    unpredictably (floor_plan/other), so only the safe flag is enforced."""
+    if not image_bytes:
+        return None
+    if frappe.conf.get("ai_moderation_disabled"):
+        return None
+    if not ai_cfg.get_api_key("gemini"):
+        # Can't moderate without a key; the generation vendor's own safety
+        # filter (A3) remains the backstop.
+        return None
+
+    try:
+        text, usage = _gemini_vision(
+            _MODERATION_MODEL, _MODERATION_PROMPT, image_bytes, mime
+        )
+        verdict = json.loads(text)
+    except _VendorError as e:
+        if e.code == "SAFETY_BLOCKED":
+            # Gemini refused to even look at it — definitely reject.
+            raise _VendorError("MODERATION_REJECTED", _MODERATION_UNSAFE_MESSAGE,
+                               detail="moderation call safety-blocked")
+        frappe.log_error(
+            f"moderation skipped (fail-open): {e.code}: {e.detail or e}",
+            "ai_worker.moderation",
+        )
+        return None
+    except (json.JSONDecodeError, TypeError):
+        frappe.log_error(
+            f"moderation verdict unparseable (fail-open): {text[:200]}",
+            "ai_worker.moderation",
+        )
+        return usage
+
+    if verdict.get("safe") is False:
+        raise _VendorError(
+            "MODERATION_REJECTED", _MODERATION_UNSAFE_MESSAGE,
+            detail=f"moderation verdict: {verdict}",
+        )
+    if allow_any_category:
+        return usage
+    allowed = _MODERATION_ALLOWED.get(tool_id) or _MODERATION_ALLOWED["_image_edit"]
+    category = (verdict.get("category") or "").lower()
+    if category and category not in allowed:
+        raise _VendorError(
+            "MODERATION_REJECTED", _MODERATION_REJECT_MESSAGE,
+            detail=f"moderation verdict: {verdict} not in {sorted(allowed)}",
+        )
+    return usage
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +533,11 @@ def _read_uploaded_file(image_url):
             limit=1,
         )
         if not files:
-            raise _VendorError("FILE_MISSING", f"Could not load uploaded file {image_url}")
+            raise _VendorError(
+                "FILE_MISSING",
+                "We couldn't read your uploaded photo. Please upload it again.",
+                detail=f"Could not load uploaded file {image_url}",
+            )
         file_doc = frappe.get_doc("File", files[0]["name"])
         return file_doc.get_content(), _guess_mime(file_doc.file_name)
 
@@ -266,11 +671,27 @@ def _run_floor_plan(doc, payload):
         doc.cost_cents = 0
         return _mock_floor_plan_response()
 
+    if image_bytes is None:
+        # Submit validates the image is present; this guards legacy/replayed
+        # payloads from a b64encode(None) crash that would count toward the
+        # circuit breaker as WORKER_ERROR.
+        raise _VendorError(
+            "FILE_MISSING",
+            "We couldn't read your uploaded photo. Please upload it again.",
+            detail=f"job {doc.name}: floor_plan with no readable image_url",
+        )
+
+    mod_usage = _moderate_source_image("floor_plan", image_bytes, mime) or {}
+
     if vendor == "gemini":
         text, usage = _gemini_vision(model, _FLOOR_PLAN_PROMPT, image_bytes, mime)
         doc.model = model
-        doc.tokens_input = usage.get("input_tokens", 0)
-        doc.tokens_output = usage.get("output_tokens", 0)
+        doc.tokens_input = (
+            usage.get("input_tokens", 0) + mod_usage.get("input_tokens", 0)
+        )
+        doc.tokens_output = (
+            usage.get("output_tokens", 0) + mod_usage.get("output_tokens", 0)
+        )
         doc.cost_cents = max(
             1,
             int(round(
@@ -305,20 +726,16 @@ def _gemini_vision(model, prompt, image_bytes, mime):
             "responseMimeType": "application/json",
         },
     }
-    try:
-        resp = requests.post(url, json=body, timeout=60)
-    except requests.RequestException as e:
-        raise _VendorError("VENDOR_NETWORK", f"Gemini request failed: {e}")
-    if resp.status_code != 200:
-        raise _VendorError(
-            "VENDOR_HTTP",
-            f"Gemini returned {resp.status_code}: {resp.text[:300]}",
-        )
+    resp = _post_json_with_retry(url, body, timeout=60, vendor="Gemini")
     data = resp.json()
+    _check_gemini_safety(data)
     try:
         text = data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError):
-        raise _VendorError("VENDOR_RESPONSE", f"Unexpected Gemini shape: {data}")
+        raise _VendorError(
+            "VENDOR_RESPONSE", _VENDOR_USER_MESSAGES["VENDOR_RESPONSE"],
+            detail=f"Unexpected Gemini shape: {str(data)[:500]}",
+        )
     usage = data.get("usageMetadata") or {}
     return text, {
         "input_tokens": usage.get("promptTokenCount", 0),
@@ -333,7 +750,10 @@ def _parse_floor_plan_response(text):
         start = text.find("{")
         end = text.rfind("}")
         if start == -1 or end == -1:
-            raise _VendorError("VENDOR_RESPONSE", "AI did not return JSON.")
+            raise _VendorError(
+                "VENDOR_RESPONSE", _VENDOR_USER_MESSAGES["VENDOR_RESPONSE"],
+                detail="Floor-plan response was not JSON.",
+            )
         ai = json.loads(text[start : end + 1])
 
     return {
@@ -494,6 +914,59 @@ def _prompt_floor(p):
     return ", ".join(parts)
 
 
+# C2: text mode — create from imagination, no source photo. The photo-mode
+# builders all say "this room/facade" and "preserve the original geometry",
+# which is meaningless (and confusing to the model) without an input image.
+def _prompt_text_mode(tool_id, p):
+    if tool_id == "interior":
+        base = (
+            f"Photorealistic interior design concept of a "
+            f"{p.get('room') or 'living room'} in {p.get('style') or 'modern'} style"
+        )
+    elif tool_id == "exterior":
+        base = (
+            "Photorealistic architectural rendering of a residential house "
+            f"exterior in {p.get('style') or 'modern'} style"
+        )
+    else:
+        base = (
+            "Photorealistic landscape design concept of a home garden "
+            f"in {p.get('style') or 'tropical'} style"
+        )
+    parts = [base]
+    if p.get("color"):
+        parts.append(f"with a {p['color']} color palette")
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append(
+        "Create the scene from imagination — there is no source photo. "
+        "Wide-angle view, realistic materials, natural lighting, magazine quality."
+    )
+    return ", ".join(parts)
+
+
+# C2: sketch mode — the uploaded image is a rough hand drawing, not a photo.
+def _prompt_sketch_mode(tool_id, p):
+    subject = {
+        "interior": f"{p.get('room') or 'room'} interior",
+        "exterior": "residential building exterior",
+        "garden": "garden or outdoor area",
+    }.get(tool_id, "space")
+    parts = [
+        f"The attached image is a rough hand-drawn sketch or plan of a {subject}",
+        f"render it as a photorealistic {p.get('style') or 'modern'} style visualization",
+    ]
+    if p.get("color"):
+        parts.append(f"with a {p['color']} color palette")
+    if p.get("notes"):
+        parts.append(p["notes"])
+    parts.append(
+        "Follow the sketch's layout, proportions and viewpoint as closely as "
+        "possible. Realistic materials and natural lighting."
+    )
+    return ", ".join(parts)
+
+
 _PROMPT_BUILDERS = {
     "interior": _prompt_interior,
     "exterior": _prompt_exterior,
@@ -512,7 +985,23 @@ def _run_image_edit(doc, payload, tool_id):
     vendor = (cfg.get("vendor") or "mock").lower()
     model = cfg.get("model") or "gemini-2.5-flash-image"
 
-    image_bytes, mime = _read_uploaded_file(payload.get("image_url"))
+    # C2: text mode runs with no source image at all; sketch mode uploads a
+    # hand drawing instead of a photo. Everything else requires the photo.
+    mode = (payload.get("mode") or "photo").strip().lower()
+    if mode not in _GENERATE_MODES:
+        mode = "photo"
+
+    image_bytes = mime = None
+    if mode != "text":
+        image_bytes, mime = _read_uploaded_file(payload.get("image_url"))
+        if image_bytes is None:
+            # Submit guarantees an image outside text mode; this guards
+            # legacy/replayed payloads from a b64encode(None) crash.
+            raise _VendorError(
+                "FILE_MISSING",
+                "We couldn't read your uploaded photo. Please upload it again.",
+                detail=f"job {doc.name}: mode={mode} with no readable image_url",
+            )
     mask_bytes = mask_mime = None
     ref_bytes = ref_mime = None
     if payload.get("mask_url"):
@@ -522,13 +1011,17 @@ def _run_image_edit(doc, payload, tool_id):
 
     builder = _PROMPT_BUILDERS.get(tool_id)
     if not builder:
-        raise _VendorError("UNKNOWN_TOOL", f"No prompt builder for tool {tool_id}")
-    prompt = builder({
-        "style": payload.get("style"),
-        "room":  payload.get("room"),
-        "color": payload.get("color"),
-        "notes": payload.get("notes"),
-    })
+        raise _VendorError(
+            "UNKNOWN_TOOL", "This tool is not available.",
+            detail=f"No prompt builder for tool {tool_id}",
+        )
+    p = _sanitize_prompt_inputs(payload)
+    if mode == "text":
+        prompt = _prompt_text_mode(tool_id, p)
+    elif mode == "sketch":
+        prompt = _prompt_sketch_mode(tool_id, p)
+    else:
+        prompt = builder(p)
 
     variations = int(doc.variation_count or 1)
     hd = (doc.quality or "std").lower() == "hd"
@@ -538,16 +1031,29 @@ def _run_image_edit(doc, payload, tool_id):
         doc.cost_cents = 0
         return _mock_image_edit(tool_id, payload, variations, prompt, hd)
 
+    # Sketches classify as floor_plan/other, so only enforce the safe flag on
+    # them; text mode has no image and the gate no-ops.
+    mod_usage = _moderate_source_image(
+        tool_id, image_bytes, mime, allow_any_category=(mode == "sketch")
+    ) or {}
+
     if vendor == "gemini":
-        return _gemini_image_edit(
+        result = _gemini_image_edit(
             doc, model, prompt, image_bytes, mime,
             mask_bytes, mask_mime, ref_bytes, ref_mime, variations, hd
         )
+    elif vendor == "fal":
+        result = _fal_image_edit(
+            doc, model, prompt, image_bytes, mime,
+            mask_bytes, ref_bytes, variations, hd
+        )
+    else:
+        raise _AIDisabled(f"Image-edit vendor {vendor} is not implemented yet.")
 
-    if vendor == "fal":
-        raise _AIDisabled("fal.ai adapter not implemented yet - set vendor to gemini or mock.")
-
-    raise _AIDisabled(f"Image-edit vendor {vendor} is not implemented yet.")
+    # Fold the moderation pass's token spend into the job's accounting.
+    doc.tokens_input = (doc.tokens_input or 0) + mod_usage.get("input_tokens", 0)
+    doc.tokens_output = (doc.tokens_output or 0) + mod_usage.get("output_tokens", 0)
+    return result
 
 
 def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
@@ -572,8 +1078,10 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
         parts.append({"text": "Use the next image as a style reference."})
         parts.append({"inline_data": {"mime_type": ref_mime or "image/jpeg",
                                        "data": base64.b64encode(ref_bytes).decode("ascii")}})
-    parts.append({"inline_data": {"mime_type": mime or "image/jpeg",
-                                   "data": base64.b64encode(image_bytes).decode("ascii")}})
+    # C2 text mode is pure text-to-image — no source image part.
+    if image_bytes:
+        parts.append({"inline_data": {"mime_type": mime or "image/jpeg",
+                                       "data": base64.b64encode(image_bytes).decode("ascii")}})
 
     body_template = {
         "contents": [{"role": "user", "parts": parts}],
@@ -588,16 +1096,10 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
     def _call_once(idx):
         body = json.loads(json.dumps(body_template))
         body["generationConfig"]["seed"] = 1000 + idx * 17
-        try:
-            resp = requests.post(url, json=body, timeout=120)
-        except requests.RequestException as e:
-            raise _VendorError("VENDOR_NETWORK", f"Gemini request failed: {e}")
-        if resp.status_code != 200:
-            raise _VendorError(
-                "VENDOR_HTTP",
-                f"Gemini returned {resp.status_code}: {resp.text[:300]}",
-            )
-        return resp.json()
+        resp = _post_json_with_retry(url, body, timeout=120, vendor="Gemini")
+        data = resp.json()
+        _check_gemini_safety(data)
+        return data
 
     results = []
     with ThreadPoolExecutor(max_workers=min(4, variations)) as ex:
@@ -623,7 +1125,10 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
                     inline = p["inlineData"]
                     break
             if not inline:
-                raise _VendorError("VENDOR_RESPONSE", f"Gemini response had no image part: {data}")
+                raise _VendorError(
+                    "VENDOR_RESPONSE", _VENDOR_USER_MESSAGES["VENDOR_RESPONSE"],
+                    detail=f"Gemini response had no image part: {str(data)[:500]}",
+                )
             img_bytes = base64.b64decode(inline.get("data") or inline.get("data_b64") or "")
             img_mime = inline.get("mime_type") or inline.get("mimeType") or "image/png"
             if watermark:
@@ -633,7 +1138,10 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
             url_saved = _save_result_image(f"ai_{doc.name}_v{i}", img_bytes, img_mime)
             images.append({"url": url_saved, "thumb_url": url_saved, "seed": 1000 + i * 17})
         except (KeyError, IndexError):
-            raise _VendorError("VENDOR_RESPONSE", f"Unexpected Gemini shape: {data}")
+            raise _VendorError(
+                "VENDOR_RESPONSE", _VENDOR_USER_MESSAGES["VENDOR_RESPONSE"],
+                detail=f"Unexpected Gemini shape: {str(data)[:500]}",
+            )
         usage = data.get("usageMetadata") or {}
         total_tokens_in += int(usage.get("promptTokenCount", 0))
         total_tokens_out += int(usage.get("candidatesTokenCount", 0))
@@ -647,6 +1155,157 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
     doc.cost_cents = max(1, per_image_cents * len(images))
 
     return {"images": images, "prompt": prompt, "model": model, "hd": hd}
+
+
+# ---------------------------------------------------------------------------
+# fal.ai adapter (B2) — FLUX Kontext image-to-image via the fal queue API.
+# Same contract as _gemini_image_edit. Selected per-tool by setting the
+# AI Tool Config row's vendor to "fal"; model must be a fal model id
+# (e.g. "fal-ai/flux-kontext/dev"), otherwise the default below is used.
+# ---------------------------------------------------------------------------
+
+_FAL_DEFAULT_MODEL = "fal-ai/flux-kontext/dev"
+_FAL_QUEUE_BASE = "https://queue.fal.run"
+_FAL_POLL_INTERVAL_SEC = 2
+_FAL_POLL_TIMEOUT_SEC = 240
+
+
+def _fal_image_edit(doc, model, prompt, image_bytes, mime,
+                    mask_bytes, ref_bytes, variations, hd):
+    api_key = _require_key("fal")
+    # A Gemini model string on the config row (leftover from a vendor flip)
+    # is not a fal id — fal ids always contain a slash.
+    model_id = model if "/" in (model or "") else _FAL_DEFAULT_MODEL
+
+    if mask_bytes or ref_bytes:
+        # FLUX Kontext (dev) takes a single input image; silently ignoring the
+        # mask/reference would produce results the user didn't ask for.
+        raise _VendorError(
+            "VENDOR_UNSUPPORTED",
+            "This tool isn't available right now. Please try another tool.",
+            detail=f"fal adapter has no mask/ref support (model {model_id})",
+        )
+    if image_bytes is None:
+        # C2 text mode: Kontext is image-to-image only.
+        raise _VendorError(
+            "VENDOR_UNSUPPORTED",
+            "Creating a design without a photo isn't available right now. "
+            "Please start from a photo instead.",
+            detail=f"fal adapter requires a source image (model {model_id})",
+        )
+
+    headers = {"Authorization": f"Key {api_key}"}
+    data_uri = (
+        f"data:{mime or 'image/jpeg'};base64,"
+        + base64.b64encode(image_bytes).decode("ascii")
+    )
+    body = {
+        "prompt": prompt,
+        "image_url": data_uri,
+        "num_images": max(1, min(4, variations)),
+        "output_format": "jpeg",
+    }
+
+    submit = _post_json_with_retry(
+        f"{_FAL_QUEUE_BASE}/{model_id}", body,
+        timeout=60, vendor="fal.ai", headers=headers,
+    ).json()
+    request_id = submit.get("request_id")
+    if not request_id:
+        raise _VendorError(
+            "VENDOR_RESPONSE", _VENDOR_USER_MESSAGES["VENDOR_RESPONSE"],
+            detail=f"fal submit had no request_id: {str(submit)[:300]}",
+        )
+
+    status_url = f"{_FAL_QUEUE_BASE}/{model_id}/requests/{request_id}/status"
+    result_url = f"{_FAL_QUEUE_BASE}/{model_id}/requests/{request_id}"
+
+    deadline = time.monotonic() + _FAL_POLL_TIMEOUT_SEC
+    while True:
+        if time.monotonic() > deadline:
+            raise _VendorError(
+                "VENDOR_TIMEOUT", _VENDOR_USER_MESSAGES["VENDOR_TIMEOUT"],
+                detail=f"fal request {request_id} still queued after "
+                       f"{_FAL_POLL_TIMEOUT_SEC}s",
+            )
+        try:
+            status_resp = requests.get(status_url, headers=headers, timeout=30)
+        except requests.RequestException:
+            time.sleep(_FAL_POLL_INTERVAL_SEC)
+            continue
+        if status_resp.status_code != 200:
+            time.sleep(_FAL_POLL_INTERVAL_SEC)
+            continue
+        status = (status_resp.json().get("status") or "").upper()
+        if status == "COMPLETED":
+            break
+        if status in {"FAILED", "ERROR", "CANCELLED"}:
+            raise _VendorError(
+                "VENDOR_UNAVAILABLE", _VENDOR_USER_MESSAGES["VENDOR_UNAVAILABLE"],
+                detail=f"fal request {request_id} ended {status}",
+            )
+        time.sleep(_FAL_POLL_INTERVAL_SEC)
+
+    try:
+        result = requests.get(result_url, headers=headers, timeout=60).json()
+    except (requests.RequestException, ValueError) as e:
+        raise _VendorError(
+            "VENDOR_RESPONSE", _VENDOR_USER_MESSAGES["VENDOR_RESPONSE"],
+            detail=f"fal result fetch failed: {e}",
+        )
+
+    remote_images = result.get("images") or []
+    if not remote_images:
+        # fal surfaces NSFW filtering as an empty/flagged image list.
+        if result.get("has_nsfw_concepts"):
+            raise _VendorError("SAFETY_BLOCKED", _SAFETY_USER_MESSAGE,
+                               detail=f"fal flagged NSFW: {str(result)[:300]}")
+        raise _VendorError(
+            "VENDOR_RESPONSE", _VENDOR_USER_MESSAGES["VENDOR_RESPONSE"],
+            detail=f"fal result had no images: {str(result)[:300]}",
+        )
+
+    watermark = not ai_cfg.is_premium(doc.user)
+    images = []
+    for i, entry in enumerate(remote_images):
+        img_url = entry.get("url")
+        if not img_url:
+            continue
+        try:
+            img_resp = requests.get(img_url, timeout=60)
+            img_resp.raise_for_status()
+        except requests.RequestException as e:
+            raise _VendorError(
+                "VENDOR_NETWORK", _VENDOR_USER_MESSAGES["VENDOR_NETWORK"],
+                detail=f"fal image download failed: {e}",
+            )
+        img_bytes = img_resp.content
+        img_mime = entry.get("content_type") or "image/jpeg"
+        if watermark:
+            wm_bytes, wm_mime = _watermark_bytes(img_bytes)
+            if wm_mime:
+                img_bytes, img_mime = wm_bytes, wm_mime
+        url_saved = _save_result_image(f"ai_{doc.name}_v{i}", img_bytes, img_mime)
+        images.append({
+            "url": url_saved,
+            "thumb_url": url_saved,
+            "seed": result.get("seed") or (1000 + i * 17),
+        })
+
+    if not images:
+        raise _VendorError(
+            "VENDOR_RESPONSE", _VENDOR_USER_MESSAGES["VENDOR_RESPONSE"],
+            detail="fal result images all lacked URLs",
+        )
+
+    doc.model = model_id
+    doc.tokens_input = 0
+    doc.tokens_output = 0
+    # FLUX Kontext dev lists at ~$0.025/image; keep a small buffer.
+    per_image_cents = 4 if hd else 3
+    doc.cost_cents = max(1, per_image_cents * len(images))
+
+    return {"images": images, "prompt": prompt, "model": model_id, "hd": hd}
 
 
 def _mock_image_edit(tool_id, payload, variations, prompt, hd):

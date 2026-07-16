@@ -229,6 +229,51 @@ def seed_default_tool_configs():
     return added
 
 
+def verify_live_tool_configs():
+    """Config-drift smoke test (B4), run daily from hooks.py.
+
+    The in-code defaults above still say vendor="mock" for the image tools,
+    so a fresh site, a wiped child table, or a re-run seed patch would
+    silently serve placeholder images in production. This asserts every
+    enabled tool points at a real vendor WITH an API key present, and logs
+    loudly when anything has drifted back.
+
+    Dev sites that intentionally run on mock can set
+    `ai_allow_mock_vendor: 1` in site_config.json to silence it.
+    Returns the list of problems (empty = healthy) so it can also be called
+    ad-hoc from `bench execute` as a deploy-time check."""
+    if frappe.conf.get("ai_allow_mock_vendor"):
+        return []
+
+    doc = get_settings()
+    problems = []
+    for tool_id in _DEFAULT_TOOL_CONFIGS:
+        cfg = get_job_config(tool_id)
+        if not cfg.get("enabled"):
+            continue
+        vendor = (cfg.get("vendor") or "mock").lower()
+        if vendor == "mock":
+            problems.append(
+                f"{tool_id}: vendor is 'mock' — users are getting placeholder "
+                "images, not real AI output"
+            )
+            continue
+        if not get_api_key(vendor):
+            problems.append(
+                f"{tool_id}: vendor '{vendor}' has no API key configured — "
+                "every run will fail"
+            )
+    if not doc.enabled:
+        problems.append("AI Settings.enabled is off — all AI tools are dark")
+
+    if problems:
+        frappe.log_error(
+            "AI config drift detected:\n" + "\n".join(problems),
+            "ai_settings.config_drift",
+        )
+    return problems
+
+
 def is_premium(user):
     """True if the user has an active Premium Entry row."""
     if not user or user == 'Guest':

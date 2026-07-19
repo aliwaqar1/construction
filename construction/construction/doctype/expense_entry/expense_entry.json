@@ -15,10 +15,13 @@
   "qty",
   "uom",
   "amount",
+  "vendor",
+  "payment_method",
   "note",
   "entry_date",
   "client_created_at",
   "updated_at",
+  "updated_at_utc",
   "deleted"
  ],
  "fields": [
@@ -79,6 +82,17 @@
    "in_list_view": 1
   },
   {
+   "fieldname": "vendor",
+   "fieldtype": "Data",
+   "label": "Vendor / supplier"
+  },
+  {
+   "fieldname": "payment_method",
+   "fieldtype": "Data",
+   "label": "Payment Method",
+   "description": "cash | bank | wallet | credit (client enum key)."
+  },
+  {
    "fieldname": "note",
    "fieldtype": "Small Text",
    "label": "Note"
@@ -98,6 +112,12 @@
    "fieldtype": "Datetime",
    "label": "Updated At",
    "in_list_view": 1
+  },
+  {
+   "fieldname": "updated_at_utc",
+   "fieldtype": "Datetime",
+   "label": "Updated At (UTC)",
+   "description": "Naive-UTC twin of updated_at; preferred for LWW when both sides have it."
   },
   {
    "fieldname": "deleted",

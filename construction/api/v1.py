@@ -2365,8 +2365,9 @@ def sync_expenses(**kwargs):
         "Expense Project",
         filters={"user": user},
         fields=[
-            "client_id", "project_name", "location", "budget",
-            "estimate_client_id", "client_created_at", "updated_at", "deleted",
+            "client_id", "project_name", "location", "budget", "currency",
+            "estimate_client_id", "client_created_at", "updated_at",
+            "updated_at_utc", "archived", "deleted",
         ],
         order_by="updated_at desc",
         limit_page_length=0,
@@ -2376,8 +2377,9 @@ def sync_expenses(**kwargs):
         filters={"user": user},
         fields=[
             "client_id", "project_client_id", "category", "custom_name",
-            "material", "qty", "uom", "amount", "note", "entry_date",
-            "client_created_at", "updated_at", "deleted",
+            "material", "qty", "uom", "amount", "note", "vendor",
+            "payment_method", "entry_date",
+            "client_created_at", "updated_at", "updated_at_utc", "deleted",
         ],
         order_by="updated_at desc",
         limit_page_length=0,
@@ -2388,12 +2390,15 @@ def sync_expenses(**kwargs):
         r["updated_at"] = str(r["updated_at"]) if r.get("updated_at") else None
         r["name"] = r.pop("project_name") or ""
         r["estimate_id"] = r.pop("estimate_client_id") or None
+        r["updated_at_utc"] = str(r["updated_at_utc"]) if r.get("updated_at_utc") else None
+        r["archived"] = bool(r.get("archived"))
         r["deleted"] = bool(r.get("deleted"))
 
     for r in server_expenses:
         r["created_at"] = str(r.pop("client_created_at")) if r.get("client_created_at") else None
         r["updated_at"] = str(r["updated_at"]) if r.get("updated_at") else None
         r["date"] = str(r.pop("entry_date")) if r.get("entry_date") else None
+        r["updated_at_utc"] = str(r["updated_at_utc"]) if r.get("updated_at_utc") else None
         r["deleted"] = bool(r.get("deleted"))
 
     return {
@@ -2419,14 +2424,23 @@ def _upsert_many(doctype, user, rows, apply_fn):
                 doctype, {"user": user, "client_id": client_id}, "name"
             )
             incoming_updated = _parse_dt(row.get("updated_at"))
+            incoming_utc = _parse_utc(row.get("updated_at_utc"))
+            row["_utc_norm"] = incoming_utc
             if existing_name:
-                server_updated = frappe.db.get_value(doctype, existing_name, "updated_at")
-                if (
+                server_updated, server_utc = frappe.db.get_value(
+                    doctype, existing_name, ["updated_at", "updated_at_utc"]
+                )
+                if server_utc and incoming_utc:
+                    # Both sides carry the epoch-exact UTC twin (E14) —
+                    # timezone-safe comparison.
+                    if incoming_utc <= server_utc:
+                        continue
+                elif (
                     server_updated
                     and incoming_updated
                     and incoming_updated <= server_updated
                 ):
-                    # Server is newer — keep it.
+                    # Legacy naive-local compare for pre-E14 rows.
                     continue
                 doc = frappe.get_doc(doctype, existing_name)
             else:
@@ -2450,6 +2464,7 @@ def _apply_expense_project(doc, row):
     doc.project_name = (row.get("name") or "")[:160]
     doc.location = (row.get("location") or "")[:160]
     doc.budget = float(row.get("budget") or 0)
+    doc.currency = (row.get("currency") or "PKR")[:8]
     doc.estimate_client_id = row.get("estimate_id") or ""
     doc.client_created_at = (
         _parse_dt(row.get("created_at")) or frappe.utils.now_datetime()
@@ -2457,6 +2472,8 @@ def _apply_expense_project(doc, row):
     doc.updated_at = (
         _parse_dt(row.get("updated_at")) or frappe.utils.now_datetime()
     )
+    doc.updated_at_utc = row.get("_utc_norm")
+    doc.archived = 1 if row.get("archived") else 0
     doc.deleted = 1 if row.get("deleted") else 0
 
 
@@ -2469,6 +2486,8 @@ def _apply_expense_entry(doc, row):
     doc.uom = (row.get("uom") or "")[:40]
     doc.amount = float(row.get("amount") or 0)
     doc.note = (row.get("note") or "")[:1000]
+    doc.vendor = (row.get("vendor") or "")[:160]
+    doc.payment_method = (row.get("payment_method") or "")[:20]
     doc.entry_date = _parse_dt(row.get("date"))
     doc.client_created_at = (
         _parse_dt(row.get("created_at")) or frappe.utils.now_datetime()
@@ -2476,7 +2495,30 @@ def _apply_expense_entry(doc, row):
     doc.updated_at = (
         _parse_dt(row.get("updated_at")) or frappe.utils.now_datetime()
     )
+    doc.updated_at_utc = row.get("_utc_norm")
     doc.deleted = 1 if row.get("deleted") else 0
+
+
+def _parse_utc(value):
+    """Parse an ISO-8601 instant into naive-UTC. Offset-aware input is
+    converted to UTC then stripped; naive input is assumed to already be UTC
+    (the client only sends naive-UTC in updated_at_utc). Absurdly-future
+    stamps (> 1 day ahead) are clamped to now so a device with a wrong clock
+    can't permanently win last-write-wins (E6). Returns None on garbage."""
+    if not value:
+        return None
+    from datetime import datetime, timedelta, timezone as _tz
+    try:
+        from dateutil import parser as _du
+        dt = _du.isoparse(str(value))
+    except Exception:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(_tz.utc).replace(tzinfo=None)
+    now = datetime.utcnow()
+    if dt > now + timedelta(days=1):
+        dt = now
+    return dt
 
 
 def _parse_dt(value):

@@ -11,10 +11,13 @@
   "project_name",
   "location",
   "budget",
+  "currency",
   "estimate_client_id",
   "client_created_at",
   "updated_at",
-  "deleted"
+  "updated_at_utc",
+  "deleted",
+  "archived"
  ],
  "fields": [
   {
@@ -53,6 +56,13 @@
    "label": "Budget"
   },
   {
+   "fieldname": "currency",
+   "fieldtype": "Data",
+   "label": "Currency",
+   "default": "PKR",
+   "description": "ISO code the budget/expenses are denominated in."
+  },
+  {
    "fieldname": "estimate_client_id",
    "fieldtype": "Data",
    "label": "Linked Estimate (client_id)",
@@ -71,11 +81,24 @@
    "description": "Last-write-wins key \u2014 newer wins on sync conflict."
   },
   {
+   "fieldname": "updated_at_utc",
+   "fieldtype": "Datetime",
+   "label": "Updated At (UTC)",
+   "description": "Naive-UTC twin of updated_at; preferred for LWW when both sides have it."
+  },
+  {
    "fieldname": "deleted",
    "fieldtype": "Check",
    "label": "Deleted (tombstone)",
    "default": "0",
    "description": "Soft-delete flag so deletions propagate across devices."
+  },
+  {
+   "fieldname": "archived",
+   "fieldtype": "Check",
+   "label": "Archived",
+   "default": "0",
+   "description": "Completed build parked out of the active list."
   }
  ],
  "index_web_pages_for_search": 0,

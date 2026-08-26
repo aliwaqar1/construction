@@ -1041,7 +1041,18 @@ def _spend_in_window(tool_id, since):
     )
     spent = sum((r.get("cost_cents") or 0) for r in rows)
 
-    inflight_filters = {"status": ["in", ["queued", "running"]]}
+    # Only work the watchdog would still consider alive. An unbounded
+    # `queued`/`running` filter also counted jobs that had been stuck for
+    # weeks, so a single wedged row inflated the cap permanently and paused
+    # the free tier for everyone with no live spend behind it. Past
+    # `_STALE_QUEUED_HOURS` a job is the watchdog's problem, not the budget's.
+    from frappe.utils import add_to_date, now_datetime
+
+    inflight_floor = max(since, add_to_date(now_datetime(), hours=-_STALE_QUEUED_HOURS))
+    inflight_filters = {
+        "status": ["in", ["queued", "running"]],
+        "creation": [">=", inflight_floor],
+    }
     if tool_id:
         inflight_filters["job_type"] = tool_id
     inflight = frappe.get_all(
@@ -2411,9 +2422,17 @@ def _premium_table_lock(timeout=15):
     return _user_ledger_lock("ai-settings-premium-users", timeout=timeout)
 
 
-def _premium_rows(user=None, purchase_token=None):
+def _premium_rows(
+    user=None, purchase_token=None, extra_filters=None, order_by=None, limit=0
+):
     """Premium entries, optionally filtered. Read straight from the child
-    table so callers don't have to load and walk the singleton."""
+    table so callers don't have to load and walk the singleton.
+
+    `extra_filters`, `order_by` and `limit` exist so a caller that can only
+    afford to look at N rows can push the selection into SQL. Slicing the
+    full result in Python instead meant revoked and lapsed rows consumed the
+    budget before any live one was reached.
+    """
     filters = {
         "parent": "AI Settings",
         "parenttype": "AI Settings",
@@ -2423,6 +2442,8 @@ def _premium_rows(user=None, purchase_token=None):
         filters["user"] = user
     if purchase_token:
         filters["purchase_token"] = purchase_token
+    if extra_filters:
+        filters.update(extra_filters)
     return frappe.get_all(
         "User Premium Entry",
         filters=filters,
@@ -2430,7 +2451,8 @@ def _premium_rows(user=None, purchase_token=None):
             "name", "user", "expires_at", "note", "platform",
             "purchase_token", "last_verified_at", "revoked_at",
         ],
-        limit_page_length=0,
+        order_by=order_by,
+        limit_page_length=int(limit or 0),
     )
 
 
@@ -2652,49 +2674,56 @@ def _reject_foreign_receipt(user, purchase_token, obfuscated_account_id):
     return None
 
 
-def _clawback_credits(user, purchase_token, reason):
+def _clawback_credits(user, purchase_token, reason, state=None, period=None):
     """Write the `clawback_refund` event the ledger schema has always defined
     and nothing has ever written.
 
     Removes the granted credits the revoked purchase paid for, down to zero —
     we claw back what is left, not what was spent, because a negative balance
     from a refund would lock a user out of the free tier too.
+
+    `state` and `period` MUST be the ones captured while the entitlement was
+    still live (see `_revoke_premium_row`). Reading them here instead meant
+    reading them *after* `expires_at` had been set to now: the user had
+    already fallen back to a calendar period, where the monthly bucket reads
+    empty because the Pro grant lives under the billing-anchor label. The
+    clawback then took the whole amount out of `topup` — credits bought in a
+    separate transaction — and left the grant it was aimed at untouched.
+
+    Only the monthly bucket is subject to clawback. Topup credits are a
+    distinct purchase; voiding a subscription is not grounds to confiscate
+    them, and if that pack was itself refunded Play sends its own voided
+    notification for that token.
     """
-    state = _get_credit_state(user)
-    take = min(
-        max(0, state["monthly_balance"]) + max(0, state["topup_balance"]),
-        _DEFAULT_MONTHLY_QUOTA,
-    )
+    state = state or _get_credit_state(user)
+    period = period or _current_period_month(user)
+    take = min(max(0, state["monthly_balance"]), _DEFAULT_MONTHLY_QUOTA)
     if take <= 0:
         return 0
-    monthly_take = min(max(0, state["monthly_balance"]), take)
-    topup_take = take - monthly_take
-    base = _idem("clawback", user, purchase_token)
-    if monthly_take > 0:
-        _insert_ledger_event(
-            user,
-            event_type="clawback_refund",
-            bucket="monthly",
-            delta=-monthly_take,
-            reason=reason[:200],
-            idempotency_key=f"{base}:m",
-            period_month=_current_period_month(user),
-        )
-    if topup_take > 0:
-        _insert_ledger_event(
-            user,
-            event_type="clawback_refund",
-            bucket="topup",
-            delta=-topup_take,
-            reason=reason[:200],
-            idempotency_key=f"{base}:t",
-        )
+    _insert_ledger_event(
+        user,
+        event_type="clawback_refund",
+        bucket="monthly",
+        delta=-take,
+        reason=reason[:200],
+        idempotency_key=f"{_idem('clawback', user, purchase_token)}:m",
+        period_month=period,
+    )
     return take
 
 
 def _revoke_premium_row(row_name, user, purchase_token, reason):
     """Mark one entitlement revoked and claw back its credits. Idempotent."""
     from frappe.utils import now_datetime
+
+    # Captured BEFORE the row is expired, because both values are derived from
+    # the live entitlement — see `_clawback_credits`.
+    try:
+        period = _current_period_month(user)
+        state = _get_credit_state(user)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "v1.revoke_premium.state")
+        period, state = None, None
 
     frappe.db.set_value(
         "User Premium Entry",
@@ -2703,13 +2732,29 @@ def _revoke_premium_row(row_name, user, purchase_token, reason):
         update_modified=False,
     )
     frappe.clear_document_cache("AI Settings", "AI Settings")
-    try:
-        _clawback_credits(user, purchase_token, reason)
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "v1.revoke_premium.clawback")
-    frappe.log_error(
-        f"Premium revoked for {user}: {reason}", "v1.premium_revoked"
-    )
+    if state is not None:
+        try:
+            # The ledger write is a read-decide-insert like every other, and
+            # this one runs from a scheduler and a webhook, i.e. concurrently
+            # with the user's own submits.
+            with _user_ledger_lock(user):
+                _clawback_credits(
+                    user, purchase_token, reason, state=state, period=period
+                )
+        except LedgerLockError:
+            # The entitlement is revoked either way; only the credit clawback
+            # is lost, and nothing retries it (revalidation skips revoked
+            # rows). Loud enough to reconcile by hand.
+            frappe.log_error(
+                f"Premium revoked for {user} but the credit clawback could "
+                f"not run: ledger busy. Reconcile manually.",
+                "v1.revoke_premium.clawback_busy",
+            )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "v1.revoke_premium.clawback")
+    # Not an error — a revocation is an ordinary lifecycle event — but it moves
+    # money, so it belongs in a log somebody actually reads.
+    frappe.logger().info(f"Premium revoked for {user}: {reason}")
 
 
 def revalidate_premium_subscriptions(limit=200):
@@ -2734,11 +2779,23 @@ def revalidate_premium_subscriptions(limit=200):
     now = now_datetime()
     checked = 0
     revoked = 0
-    for row in _premium_rows()[: int(limit)]:
-        if row.revoked_at or not row.purchase_token:
-            continue
-        if row.expires_at and row.expires_at <= now:
-            continue  # already lapsed; nothing to revoke
+    # Select in SQL, not in Python. `_premium_rows()[:limit]` took the first N
+    # rows of the whole table in insertion order and only then skipped the
+    # revoked and lapsed ones, so past N entries the live tail was never
+    # revalidated at all — and it was the same N rows every single day.
+    # Oldest check first (MariaDB sorts NULL first on ASC, so rows that have
+    # never been verified lead), which makes the cap a rotation rather than a
+    # cut-off.
+    rows = _premium_rows(
+        extra_filters={
+            "revoked_at": ["is", "not set"],
+            "purchase_token": ["is", "set"],
+            "expires_at": [">", now],
+        },
+        order_by="last_verified_at asc",
+        limit=int(limit),
+    )
+    for row in rows:
         checked += 1
         try:
             verified = play_billing.verify_subscription(row.purchase_token)
@@ -2776,11 +2833,6 @@ def revalidate_premium_subscriptions(limit=200):
     frappe.clear_document_cache("AI Settings", "AI Settings")
     frappe.db.commit()
     return {"checked": checked, "revoked": revoked}
-
-
-# Play RTDN states that end entitlement immediately. 12 = REVOKED,
-# 13 = EXPIRED, 3 = PURCHASED-then-refunded is delivered as SUBSCRIPTION_REVOKED.
-_RTDN_TERMINAL = {12, 13}
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
@@ -3315,6 +3367,20 @@ def _user_ledger_lock(user, timeout=10):
     commits taken inside the block, and it is always released in `finally`.
     """
     key = "credits:" + hashlib.sha256((user or "").encode("utf-8")).hexdigest()[:48]
+
+    # Re-entrant. The refund helpers take this lock themselves so the worker
+    # and the watchdog are covered, but `_ai_submit` already holds it when it
+    # compensates a failed enqueue. Tracking what this connection holds keeps
+    # the inner acquisition a no-op instead of relying on MariaDB's recursive
+    # GET_LOCK counter and a matching number of releases.
+    held = getattr(frappe.local, "_ledger_locks_held", None)
+    if held is None:
+        held = set()
+        frappe.local._ledger_locks_held = held
+    if key in held:
+        yield
+        return
+
     try:
         got = frappe.db.sql("select get_lock(%s, %s)", (key, int(timeout)))
     except Exception:
@@ -3322,9 +3388,11 @@ def _user_ledger_lock(user, timeout=10):
         raise LedgerLockError("Could not acquire the credit lock")
     if not got or not got[0] or not got[0][0]:
         raise LedgerLockError("Timed out acquiring the credit lock")
+    held.add(key)
     try:
         yield
     finally:
+        held.discard(key)
         try:
             frappe.db.sql("select release_lock(%s)", (key,))
         except Exception:
@@ -3350,15 +3418,32 @@ def _shift_month(d, months):
 
 def _billing_period_start(anchor_day, today=None):
     """Start date of the billing period containing `today`, for a subscription
-    whose renewal falls on `anchor_day` of the month."""
+    whose renewal falls on `anchor_day` of the month.
+
+    Every date built here is clamped to its own month's length. The previous
+    version clamped the first construction and then rebuilt the fallback from
+    the raw `anchor_day`, so an anchor of the 29th-31st raised `ValueError:
+    day is out of range for month` for most of every short month. This sits
+    under `_get_credit_state`, so that took out every balance read and every
+    AI submit for the subscribers it hit.
+    """
     import calendar
     from datetime import date
 
+    def _on(year, month, day):
+        return date(year, month, min(day, calendar.monthrange(year, month)[1]))
+
     today = today or frappe.utils.getdate(frappe.utils.now_datetime())
-    day = min(int(anchor_day), calendar.monthrange(today.year, today.month)[1])
-    start = date(today.year, today.month, day)
+    anchor_day = int(anchor_day)
+    start = _on(today.year, today.month, anchor_day)
     if start > today:
-        start = _shift_month(date(today.year, today.month, int(anchor_day)), -1)
+        # Still before this month's renewal, so we are in the period that
+        # opened on the previous month's anchor. Clamp against THAT month.
+        prev_year, prev_month = (
+            (today.year - 1, 12) if today.month == 1
+            else (today.year, today.month - 1)
+        )
+        start = _on(prev_year, prev_month, anchor_day)
     return start
 
 
@@ -3611,6 +3696,12 @@ _BOOTSTRAP_IP_DAILY_CAP = 120
 # a crash loop legitimately produces a burst — but finite.
 _CLIENT_ERROR_IP_DAILY_CAP = 500
 
+# Ceiling on LEGACY ACCOUNT ADOPTIONS from one IP per day (see
+# `anon_bootstrap`). Deliberately tight: a genuine device adopts exactly one
+# account, exactly once. Anything working through a list of device ids is not
+# a genuine device.
+_ADOPT_IP_DAILY_CAP = 5
+
 
 def _ip_daily_allowed(prefix, cap, ip=None):
     """Atomically claim one slot of a per-IP daily budget.
@@ -3697,7 +3788,13 @@ def _debit_credits(user, amount, ref_doctype, ref_name, reason=None, idempotency
     if state["total_balance"] < amount:
         return {"applied": 0, "monthly_taken": 0, "topup_taken": 0, "balance_after": state["total_balance"]}
 
-    monthly_take = min(state["monthly_balance"], amount)
+    # Clamp at zero before splitting. `_get_credit_state` deliberately reports
+    # buckets unclamped so overspend stays visible, but a NEGATIVE
+    # `monthly_balance` here made `monthly_take` negative, which pushed
+    # `topup_take = amount - monthly_take` ABOVE `amount` — the user was
+    # silently charged the overdraft a second time out of their topup bucket,
+    # while `applied` still summed to exactly `amount` so nothing surfaced.
+    monthly_take = min(max(0, state["monthly_balance"]), amount)
     topup_take = amount - monthly_take
     balance_after = 0
 
@@ -3831,17 +3928,66 @@ def _refund_job_credits(user, job_name, job_idempotency_key=None, reason=None):
     the refund independent of that write: if the labelled rows aren't there, we
     find them by key, label them, and refund normally.
     """
-    found = frappe.db.get_value(
-        "AI Credit Ledger",
-        {
-            "user": user,
-            "ref_doctype": "AI Job",
-            "ref_name": job_name,
-            "event_type": "debit_submit",
-        },
-        "name",
-    )
-    if not found and job_idempotency_key:
+    # Read-decide-insert, same as the debit, and this one runs from the worker
+    # and the watchdog — concurrently with the user's own submits by
+    # definition. `_debit_credits` documents the requirement; the refund side
+    # has to honour it too. Re-entrant, so `_ai_submit` compensating its own
+    # failed enqueue while already holding the lock is fine.
+    with _user_ledger_lock(user):
+        found = frappe.db.get_value(
+            "AI Credit Ledger",
+            {
+                "user": user,
+                "ref_doctype": "AI Job",
+                "ref_name": job_name,
+                "event_type": "debit_submit",
+            },
+            "name",
+        )
+        if not found and job_idempotency_key:
+            m_key, t_key = _job_debit_keys(user, job_idempotency_key)
+            if m_key:
+                frappe.db.sql(
+                    """update `tabAI Credit Ledger`
+                       set ref_name = %(name)s
+                       where user = %(user)s
+                         and ref_doctype = 'AI Job'
+                         and (ref_name is null or ref_name = '')
+                         and idempotency_key in (%(m_key)s, %(t_key)s)""",
+                    {"name": job_name, "user": user, "m_key": m_key, "t_key": t_key},
+                )
+        return _refund_credits(user, "AI Job", job_name, reason=reason)
+
+
+def _refund_partial_credits(
+    user, ref_doctype, ref_name, delivered, paid_for, reason=None,
+    job_idempotency_key=None,
+):
+    """Refund the share of a debit covering work that was never delivered.
+
+    A four-variation run that returns two images was charged for four. The
+    per-variation share of the original debit is returned to the topup bucket
+    (which never expires), keyed idempotently on the job so a worker retry
+    can't refund twice.
+
+    Like `_refund_job_credits`, this recovers the debit rows from the job's
+    own idempotency key when the opportunistic `ref_name` backfill never ran.
+    Without that it found no debits, computed a charge of 0, and returned
+    silently — the same swallowed-backfill failure mode that disabled full
+    refunds, reintroduced on the partial path.
+    """
+    delivered = max(0, int(delivered))
+    paid_for = max(1, int(paid_for))
+    if delivered >= paid_for:
+        return 0
+    debit_filters = {
+        "user": user,
+        "ref_doctype": ref_doctype,
+        "ref_name": ref_name,
+        "event_type": "debit_submit",
+    }
+    debits = frappe.get_all("AI Credit Ledger", filters=debit_filters, fields=["delta"])
+    if not debits and job_idempotency_key and ref_doctype == "AI Job":
         m_key, t_key = _job_debit_keys(user, job_idempotency_key)
         if m_key:
             frappe.db.sql(
@@ -3851,49 +3997,28 @@ def _refund_job_credits(user, job_name, job_idempotency_key=None, reason=None):
                      and ref_doctype = 'AI Job'
                      and (ref_name is null or ref_name = '')
                      and idempotency_key in (%(m_key)s, %(t_key)s)""",
-                {"name": job_name, "user": user, "m_key": m_key, "t_key": t_key},
+                {"name": ref_name, "user": user, "m_key": m_key, "t_key": t_key},
             )
-    return _refund_credits(user, "AI Job", job_name, reason=reason)
-
-
-def _refund_partial_credits(user, ref_doctype, ref_name, delivered, paid_for, reason=None):
-    """Refund the share of a debit covering work that was never delivered.
-
-    A four-variation run that returns two images was charged for four. The
-    per-variation share of the original debit is returned to the topup bucket
-    (which never expires), keyed idempotently on the job so a worker retry
-    can't refund twice.
-    """
-    delivered = max(0, int(delivered))
-    paid_for = max(1, int(paid_for))
-    if delivered >= paid_for:
-        return 0
-    debits = frappe.get_all(
-        "AI Credit Ledger",
-        filters={
-            "user": user,
-            "ref_doctype": ref_doctype,
-            "ref_name": ref_name,
-            "event_type": "debit_submit",
-        },
-        fields=["delta"],
-    )
+            debits = frappe.get_all(
+                "AI Credit Ledger", filters=debit_filters, fields=["delta"]
+            )
     charged = -sum(int(r.delta) for r in debits if int(r.delta) < 0)
     if charged <= 0:
         return 0
     give_back = int(round(charged * (paid_for - delivered) / float(paid_for)))
     if give_back <= 0:
         return 0
-    _insert_ledger_event(
-        user,
-        event_type="refund_failure",
-        bucket="topup",
-        delta=give_back,
-        reason=(reason or f"Partial delivery: {delivered}/{paid_for} variations")[:200],
-        ref_doctype=ref_doctype,
-        ref_name=ref_name,
-        idempotency_key=_idem("refund_partial", ref_doctype, ref_name),
-    )
+    with _user_ledger_lock(user):
+        _insert_ledger_event(
+            user,
+            event_type="refund_failure",
+            bucket="topup",
+            delta=give_back,
+            reason=(reason or f"Partial delivery: {delivered}/{paid_for} variations")[:200],
+            ref_doctype=ref_doctype,
+            ref_name=ref_name,
+            idempotency_key=_idem("refund_partial", ref_doctype, ref_name),
+        )
     return give_back
 
 
@@ -4271,6 +4396,11 @@ def anon_bootstrap(**kwargs):
     correct response is to generate a fresh device identity, which yields a
     fresh empty account rather than someone else's.
 
+    One exception, for accounts created before `Anon Device` existed: they
+    have no secret on file, so the first secret presented adopts them and
+    binds them from then on. See the branch below for why that beats
+    stranding those users.
+
     `integrity_token` is Google's signed statement that this is a genuine,
     Play-installed copy of the app on a genuine device. It gates the WELCOME
     CREDIT GRANT, not account creation — see `api/play_integrity.py` for why,
@@ -4354,15 +4484,76 @@ def anon_bootstrap(**kwargs):
                 "created": False,
             }
 
-        # No binding. Any pre-existing User row for this email predates the
-        # secret (or is someone else's); either way we will not hand out its
-        # keys on the strength of a device id alone.
-        if frappe.db.get_value("User", {"email": email}, "name"):
-            return _error_response(
-                "DEVICE_CLAIMED",
-                "This device identity is already registered. Generate a new one.",
-                403,
+        # No binding row. A pre-existing User for this email is an account
+        # created before `Anon Device` existed, so there is no secret on file
+        # to check against — the row simply predates the mechanism.
+        #
+        # Refusing it outright stranded those users permanently: the client
+        # rotates to a new device identity on 403, which silently abandons
+        # their history and credits, and "Restore purchases" then fails
+        # forever because `_reject_foreign_receipt` sees the receipt bound to
+        # the account they just walked away from. That is a worse outcome
+        # than the hole being closed.
+        #
+        # So a LEGACY account is adopted by the first secret presented for it,
+        # and bound from then on. The exposure is one bootstrap per legacy
+        # account, closing permanently the moment a real device claims it —
+        # strictly narrower than the old behaviour, where any caller naming
+        # the device id could take the account at any time, repeatedly. New
+        # accounts never take this path; they are bound at creation below.
+        legacy_user = frappe.db.get_value("User", {"email": email}, "name")
+        if legacy_user:
+            # Adoption is the one path that hands over an EXISTING account, so
+            # it gets its own tight per-IP budget. A real device adopts once,
+            # ever; anyone working through device ids harvested from old nginx
+            # logs runs out almost immediately.
+            if not _ip_daily_allowed(
+                "anon_adopt_ip", _ADOPT_IP_DAILY_CAP, ip=client_ip
+            ):
+                frappe.log_error(
+                    f"anon_bootstrap: adoption cap hit from {client_ip}",
+                    "v1.anon_bootstrap.adopt_capped",
+                )
+                return _error_response(
+                    "RATE_LIMITED",
+                    "Too many device registrations from this network today. "
+                    "Try again later.",
+                    429,
+                )
+            adopted = frappe.new_doc("Anon Device")
+            adopted.device_hash = device_hash
+            adopted.user = legacy_user
+            adopted.secret_hash = secret_hash
+            adopted.created_ip = (client_ip or "")[:45]
+            adopted.last_seen_at = frappe.utils.now_datetime()
+            adopted.bootstrap_count = 1
+            try:
+                adopted.insert(ignore_permissions=True)
+            except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
+                # Another request bound it first. Whoever won owns it; this
+                # caller has to re-present against the stored secret.
+                frappe.db.rollback()
+                return _error_response(
+                    "DEVICE_CLAIMED",
+                    "This device identity is already registered. "
+                    "Generate a new one.",
+                    403,
+                )
+            frappe.log_error(
+                f"anon_bootstrap: adopted pre-binding account {legacy_user} "
+                f"for device {device_hash[:16]} from {client_ip}",
+                "v1.anon_bootstrap.legacy_adopted",
             )
+            api_key, api_secret = _user_keys(legacy_user)
+            frappe.db.commit()
+            # No welcome grant: this account already had one, and
+            # `_grant_welcome_credits` would dedupe it anyway.
+            return {
+                "anon_user_id": legacy_user,
+                "api_key": api_key,
+                "api_secret": api_secret,
+                "created": False,
+            }
 
         # F-30: creation is unauthenticated by design, so the only thing
         # bounding it is this per-IP daily budget.

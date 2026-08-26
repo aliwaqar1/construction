@@ -23,7 +23,7 @@ Site config
         use, the service account needs the Play Integrity API enabled in its
         Google Cloud project and must be linked in Play Console.
 
-    play_integrity_mode   off | audit | enforce      (default: audit)
+    play_integrity_mode   off | audit | enforce      (default: enforce)
 
         off      No verification at all. The pre-attestation behaviour.
         audit    Verify a token when the client sends one and record the
@@ -41,8 +41,16 @@ missing). Those users can still use the app; they just do not receive free
 credits. That targets the actual risk — free credits at scale — without
 denying the product to real people.
 
-The rollout ladder is therefore: ship the client that sends tokens, sit in
-`audit` until the verdict distribution looks sane, then flip to `enforce`.
+The rollout ladder is: ship the client that sends tokens, set
+`play_integrity_mode: "audit"` until the verdict distribution looks sane, then
+remove the key (or set `enforce`) to turn it on.
+
+NOTE the default is `enforce`, not `audit`. A site that has never set the key
+is enforcing. Any client that cannot produce a token — an older build, iOS
+(`PlayIntegrityService` returns null off Android), a device without Play
+Services, an offline first launch — receives NO welcome credits. That is the
+intended trade; it is called out here because it is not what an unset config
+key usually means.
 """
 
 import base64
@@ -97,22 +105,29 @@ def _conf():
             sc.get("play_integrity_service_account_json")
             or sc.get("play_billing_service_account_json")
         ),
-        "mode": (sc.get("play_integrity_mode") or MODE_AUDIT),
+        "mode": (sc.get("play_integrity_mode") or MODE_ENFORCE),
     }
 
 
 def mode():
-    """Current enforcement mode, falling back to `audit` on a bad value rather
-    than to `enforce` — a typo in site_config must not start withholding
-    grants from real users."""
+    """Current enforcement mode. Defaults to `enforce`, and an unrecognised
+    value falls back to `enforce` too.
+
+    That is a deliberate choice to fail closed: the thing being protected is
+    the welcome credit grant, and an operator typo must not quietly reopen
+    the farming vector. The cost is borne by devices that cannot attest —
+    they still get an account, they just do not get free credits (see the
+    module docstring). Set `play_integrity_mode` to `audit` explicitly while
+    rolling out a client build that sends tokens.
+    """
     m = str(_conf()["mode"]).strip().lower()
     if m not in _VALID_MODES:
         frappe.log_error(
-            "play_integrity_mode=%r is not one of %s; treating as 'audit'."
+            "play_integrity_mode=%r is not one of %s; treating as 'enforce'."
             % (m, ", ".join(_VALID_MODES)),
             "play_integrity.bad_mode",
         )
-        return MODE_AUDIT
+        return MODE_ENFORCE
     return m
 
 

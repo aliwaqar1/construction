@@ -281,7 +281,12 @@ def _post_json_with_retry(url, body, timeout, vendor, retries=2, headers=None,
                 "VENDOR_TIMEOUT", _VENDOR_USER_MESSAGES["VENDOR_TIMEOUT"],
                 detail=f"{vendor} timeout: {e}",
             )
-            if not retry_timeouts:
+            # A CONNECT timeout never reached the vendor, so nothing was
+            # generated and nothing was billed — it stays retryable even for
+            # per-call billing. Only a read timeout is ambiguous (the vendor
+            # may have finished and charged), and that is what
+            # `retry_timeouts=False` is guarding against.
+            if not retry_timeouts and not isinstance(e, requests.ConnectTimeout):
                 raise last_err
         except requests.RequestException as e:
             last_err = _VendorError(
@@ -1213,6 +1218,7 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
             _refund_partial_credits(
                 doc.user, "AI Job", doc.name,
                 delivered=len(images), paid_for=variations,
+                job_idempotency_key=doc.idempotency_key,
             )
         except Exception:
             frappe.log_error(

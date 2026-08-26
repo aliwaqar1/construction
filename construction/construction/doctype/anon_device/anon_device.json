@@ -11,7 +11,10 @@
   "secret_hash",
   "created_ip",
   "last_seen_at",
-  "bootstrap_count"
+  "bootstrap_count",
+  "attestation_verdict",
+  "attested_at",
+  "attestation_mode"
  ],
  "fields": [
   {
@@ -59,6 +62,25 @@
    "label": "Bootstrap Count",
    "default": "0",
    "description": "How many times this device has re-fetched its keys. A sudden jump is worth investigating."
+  },
+  {
+   "fieldname": "attestation_verdict",
+   "fieldtype": "Data",
+   "label": "Attestation Verdict",
+   "length": 140,
+   "description": "Compact Play Integrity result recorded at bootstrap: reason, pass flag, and the device/app verdicts Google returned. Empty for devices that sent no token."
+  },
+  {
+   "fieldname": "attested_at",
+   "fieldtype": "Datetime",
+   "label": "Attested At"
+  },
+  {
+   "fieldname": "attestation_mode",
+   "fieldtype": "Data",
+   "label": "Attestation Mode",
+   "length": 16,
+   "description": "The play_integrity_mode in force when this verdict was recorded (audit / enforce). Without it an old row cannot be read correctly after the mode changes."
   }
  ],
  "index_web_pages_for_search": 0,

@@ -1482,52 +1482,40 @@ def _ai_submit_locked(
     if budget_err is not None:
         return budget_err
 
-    # PREM-4: credit ledger first, daily-quota as fallback. When credit gating
-    # is off, the legacy free-daily-limit path runs unchanged so nothing
-    # breaks before we have IAP wired (PREM-3) and a way for users to top up.
+    # Every priced submit debits the credit ledger. There is no longer a flag
+    # that can switch this off: `credit_gating` used to gate the whole block,
+    # was never seeded, and a missing row read as "free" — so the metered
+    # product was off by default anywhere nobody had created the row by hand.
     debit_key = None
     debit_result = None
-    # Zero-cost tools (floor plan) under credit gating, and every tool with
-    # gating off, stay bounded by the per-day free quota — otherwise flipping
-    # `credit_gating` on would silently uncap free floor-plan scans.
+    # Zero-cost tools (floor plan) can't be bounded by a debit of 0, so they
+    # stay on the per-day free quota instead. That is not a fallback; it is
+    # how a tool that costs nothing is kept finite.
     charge_free_quota = False
-    try:
-        gating_on = _credit_gating_enabled()
-    except Exception:
-        corr = _log_unhandled("v1.ai_submit.credit_gating")
-        return _error_response(
-            "SERVER_ERROR",
-            "AI is briefly unavailable. Please try again in a moment.",
-            503,
-            correlation_id=corr,
+    cost = _credit_cost_for(tool_id, quality, variations)
+    if cost > 0:
+        debit_key = _idem("ai_submit", user, idempotency_key)
+        debit_result = _debit_credits(
+            user,
+            amount=cost,
+            ref_doctype="AI Job",
+            ref_name="",  # filled in after the doc is inserted
+            reason=f"AI submit: {tool_id}",
+            idempotency_key=debit_key,
         )
-    if gating_on:
-        cost = _credit_cost_for(tool_id, quality, variations)
-        if cost > 0:
-            debit_key = _idem("ai_submit", user, idempotency_key)
-            debit_result = _debit_credits(
-                user,
-                amount=cost,
-                ref_doctype="AI Job",
-                ref_name="",  # filled in after the doc is inserted
-                reason=f"AI submit: {tool_id}",
-                idempotency_key=debit_key,
+        if debit_result.get("applied", 0) < cost:
+            state = _get_credit_state(user)
+            return _error_response(
+                "INSUFFICIENT_CREDITS",
+                "Not enough credits for this run. Top up to keep going.",
+                402,
+                details={
+                    "cost": cost,
+                    "balance": state["total_balance"],
+                    "monthly_balance": state["monthly_balance"],
+                    "topup_balance": state["topup_balance"],
+                },
             )
-            if debit_result.get("applied", 0) < cost:
-                state = _get_credit_state(user)
-                return _error_response(
-                    "INSUFFICIENT_CREDITS",
-                    "Not enough credits for this run. Top up to keep going.",
-                    402,
-                    details={
-                        "cost": cost,
-                        "balance": state["total_balance"],
-                        "monthly_balance": state["monthly_balance"],
-                        "topup_balance": state["topup_balance"],
-                    },
-                )
-        else:
-            charge_free_quota = True
     else:
         charge_free_quota = True
 
@@ -2217,13 +2205,12 @@ def cleanup_stale_ai_jobs():
             )
             doc.completed_at = now_datetime()
             doc.save(ignore_permissions=True)
-            if _credit_gating_enabled():
-                _refund_job_credits(
-                    doc.user,
-                    doc.name,
-                    doc.idempotency_key,
-                    reason="AI job stale/interrupted (watchdog)",
-                )
+            _refund_job_credits(
+                doc.user,
+                doc.name,
+                doc.idempotency_key,
+                reason="AI job stale/interrupted (watchdog)",
+            )
             failed_out += 1
         except Exception:
             frappe.log_error(frappe.get_traceback(), "v1.cleanup_stale_ai_jobs")
@@ -2511,8 +2498,8 @@ def activate_premium(**kwargs):
 
     The expiry is ALWAYS derived server-side from the Play Developer API —
     any client-sent `expires_at` is ignored. Fail-closed: when validation
-    isn't configured (see play_billing.py) and `play_billing_relaxed` is off,
-    this refuses with 503 rather than trusting the client.
+    isn't configured (see play_billing.py) this refuses with 503 rather than
+    trusting the client. There is no relaxed/QA bypass.
 
     Successful activation also seeds the current month's Pro credit grant
     (idempotent per user+period), so a fresh subscriber can generate
@@ -2540,46 +2527,36 @@ def activate_premium(**kwargs):
     user = frappe.session.user
     linked_token = None
 
-    if play_billing.relaxed_mode():
-        # Local-QA escape hatch (play_billing_relaxed in site_config, and only
-        # on a developer_mode site — see play_billing.relaxed_mode). Grants 31
-        # days keyed on the claimed product. Never enable in production.
-        from datetime import timedelta
-        frappe.log_error(
-            f"activate_premium RELAXED grant for {user} ({claimed_product})",
-            "play_billing.relaxed",
-        )
-        product_id = claimed_product or "premium"
-        expires = now_datetime() + timedelta(days=31)
-    else:
-        try:
-            verified = play_billing.verify_subscription(receipt)
-        except play_billing.PlayBillingError as e:
-            return _error_response(e.code, e.message, e.http_status)
-        product_id = verified["product_id"] or claimed_product or "premium"
-        expires = verified["expires_at"]
-        linked_token = verified.get("linked_purchase_token")
-        if not verified["entitled"] or not expires or expires <= now_datetime():
-            return _error_response(
-                "RECEIPT_NOT_ACTIVE",
-                "This subscription is not active according to Google Play.",
-                400,
-                details={"state": verified["state"]},
-            )
+    play_billing.warn_if_relaxed_configured()
 
-        # F-17: bind the receipt to the caller. Play already tells us who the
-        # purchase belongs to and the answer was being read and thrown away,
-        # so one valid token activated Pro on as many accounts as it was
-        # replayed against — each then drawing 80 credits a month.
-        claim_err = _reject_foreign_receipt(user, receipt, verified.get("obfuscated_account_id"))
-        if claim_err is not None:
-            return claim_err
+    try:
+        verified = play_billing.verify_subscription(receipt)
+    except play_billing.PlayBillingError as e:
+        return _error_response(e.code, e.message, e.http_status)
+    product_id = verified["product_id"] or claimed_product or "premium"
+    expires = verified["expires_at"]
+    linked_token = verified.get("linked_purchase_token")
+    if not verified["entitled"] or not expires or expires <= now_datetime():
+        return _error_response(
+            "RECEIPT_NOT_ACTIVE",
+            "This subscription is not active according to Google Play.",
+            400,
+            details={"state": verified["state"]},
+        )
+
+    # F-17: bind the receipt to the caller. Play already tells us who the
+    # purchase belongs to and the answer was being read and thrown away, so
+    # one valid token activated Pro on as many accounts as it was replayed
+    # against — each then drawing 80 credits a month.
+    claim_err = _reject_foreign_receipt(user, receipt, verified.get("obfuscated_account_id"))
+    if claim_err is not None:
+        return claim_err
 
     try:
         with _premium_table_lock():
             _upsert_premium_row(
                 user, product_id, expires,
-                purchase_token=(None if play_billing.relaxed_mode() else receipt),
+                purchase_token=receipt,
                 platform=(body.get("platform") or "android")[:16],
                 linked_purchase_token=linked_token,
             )
@@ -3960,6 +3937,122 @@ def _reverse_debit(user, debit_key, debit_result):
         )
 
 
+# ===========================================================================
+# FREE EXPORT ALLOWANCE
+# ===========================================================================
+# One free PDF/CSV export per account per scope, then Pro. This used to live
+# in the app's SharedPreferences, which made it advisory: clearing app data
+# handed the user a fresh allowance, indefinitely. It is an entitlement, so it
+# is counted where entitlements are counted.
+#
+# The client still holds a local copy for the offline case — export works with
+# no signal, and hard-failing an offline export to protect a soft gate would
+# be a bad trade. When the app is online, the server is authoritative.
+# ===========================================================================
+
+_EXPORT_SCOPES = ("estimate", "expense")
+
+
+def _export_claim_key(user, scope):
+    return _idem("export", user, scope)
+
+
+def _export_claimed(user, scope):
+    return bool(
+        frappe.db.exists("Export Claim", {"claim_key": _export_claim_key(user, scope)})
+    )
+
+
+@frappe.whitelist()
+def export_quota_status():
+    """What the caller may export right now, per scope.
+
+    Read-only. The app calls this to decide whether to warn "this uses your one
+    free export" before the user spends it.
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+
+    user = frappe.session.user
+    try:
+        is_premium = ai_cfg.is_premium(user)
+        scopes = {}
+        for scope in _EXPORT_SCOPES:
+            used = False if is_premium else _export_claimed(user, scope)
+            scopes[scope] = {
+                "free_used": used,
+                "allowed": True if is_premium else not used,
+            }
+        return {"premium": is_premium, "scopes": scopes}
+    except Exception:
+        corr = _log_unhandled("v1.export_quota_status")
+        return _error_response(
+            "SERVER_ERROR", "Failed to load export quota", 500, correlation_id=corr
+        )
+
+
+@frappe.whitelist(methods=["POST"])
+def claim_export(scope=None, **kwargs):
+    """Spend the free export for `scope`, or confirm Pro entitlement.
+
+    Returns {"allowed": bool, "consumed_free": bool, "premium": bool}.
+    402 when the free export for that scope is already gone.
+
+    Call this BEFORE generating the document. It is the gate, not a log: a
+    caller that skips it and exports anyway is not counted, which is why the
+    client must treat a 402 as final.
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+
+    body = _read_json_body() or {}
+    scope = (scope or body.get("scope") or "").strip().lower()
+    if scope not in _EXPORT_SCOPES:
+        return _error_response(
+            "INVALID_PARAMS",
+            "scope must be one of: %s" % ", ".join(_EXPORT_SCOPES),
+            400,
+        )
+
+    user = frappe.session.user
+    try:
+        if ai_cfg.is_premium(user):
+            # Unlimited. Deliberately records nothing: a lapsed subscriber
+            # should fall back to an unspent free export, not to one that Pro
+            # quietly burned on their behalf.
+            return {"allowed": True, "consumed_free": False, "premium": True}
+
+        doc = frappe.new_doc("Export Claim")
+        doc.user = user
+        doc.scope = scope
+        doc.claim_key = _export_claim_key(user, scope)
+        doc.claimed_at = frappe.utils.now_datetime()
+        try:
+            doc.insert(ignore_permissions=True)
+        except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
+            # Already spent — either earlier, or by a request that raced this
+            # one. Both mean the same thing to the caller.
+            frappe.db.rollback()
+            return _error_response(
+                "EXPORT_QUOTA_EXCEEDED",
+                "You have used your free export. Subscribe for unlimited PDF "
+                "and CSV reports.",
+                402,
+                details={"scope": scope},
+            )
+        frappe.db.commit()
+        return {"allowed": True, "consumed_free": True, "premium": False}
+    except Exception:
+        corr = _log_unhandled("v1.claim_export")
+        return _error_response(
+            "SERVER_ERROR", "Failed to claim the export", 500, correlation_id=corr
+        )
+
+
 @frappe.whitelist()
 def credits_balance():
     """Current credit state for the calling user. Used by the UI to render the
@@ -3977,91 +4070,21 @@ def credits_balance():
 
 
 # ============================================================================
-# G1/G2 — reward credits (rewarded ad, share-to-earn)
+# G1/G2 reward credits — REMOVED
 # ============================================================================
 #
-# Both grant +1 topup credit, hard-capped at one per user per day by the
-# ledger's idempotency key ({prefix}:{user}:{date}) — the dedupe is native to
-# _insert_ledger_event, so replays and double-taps are free no-ops. Flag-gated
-# so either lever can be shut off server-side without a release.
+# `ad_reward` and `share_reward` granted +1 credit each, capped at one per
+# user per day. Neither could verify the thing it paid for: nothing proved a
+# rewarded ad had been watched (that needs AdMob server-side verification,
+# which was never wired), and a "share" is unverifiable by construction. Any
+# client holding a valid token could POST for a free credit a day.
 #
-# G1 ships without AdMob server-side verification (SSV): the flag + the daily
-# cap + the global budget kill switch bound the abuse. SSV is the hardening
-# follow-up once a real rewarded unit id exists.
-
-_REWARD_CREDIT_AMOUNT = 1
-
-
-def _claim_daily_reward(flag_key, event_prefix, reason):
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    if not _flag_enabled(flag_key) or not _credit_gating_enabled():
-        return _error_response(
-            "REWARD_DISABLED", "This reward is not available right now.", 403
-        )
-    user = frappe.session.user
-    from frappe.utils import nowdate
-    # Hashed: the plain `{prefix}:{user}:{date}` form is 77-80 chars for an
-    # anonymous account's email and overflows the 80-char column outright for a
-    # longer one. An overflowing key does not deduplicate, which would turn the
-    # once-a-day cap into once-per-tap.
-    legacy_key = f"{event_prefix}:{user}:{nowdate()}"
-    key = _idem(event_prefix, user, nowdate())
-    try:
-        if frappe.db.get_value(
-            "AI Credit Ledger", {"idempotency_key": ["in", [key, legacy_key]]}, "name"
-        ):
-            state = _get_credit_state(user)
-            return {
-                "granted": False,
-                "reason": "DAILY_LIMIT",
-                "amount": 0,
-                "balance": state["total_balance"],
-            }
-        try:
-            balance = _insert_ledger_event(
-                user,
-                event_type="grant_reward",
-                bucket="topup",
-                delta=_REWARD_CREDIT_AMOUNT,
-                reason=reason,
-                idempotency_key=key,
-                legacy_keys=[legacy_key],
-            )
-        except (frappe.DuplicateEntryError, frappe.UniqueValidationError):
-            # Two concurrent claims raced past the pre-check; the unique index
-            # on idempotency_key stopped the second insert. That's the daily
-            # cap doing its job — report it as such, not as a server error.
-            frappe.db.rollback()
-            state = _get_credit_state(user)
-            return {
-                "granted": False,
-                "reason": "DAILY_LIMIT",
-                "amount": 0,
-                "balance": state["total_balance"],
-            }
-        frappe.db.commit()
-        return {"granted": True, "amount": _REWARD_CREDIT_AMOUNT, "balance": balance}
-    except Exception:
-        corr = _log_unhandled(f"v1.{event_prefix}")
-        return _error_response(
-            "SERVER_ERROR", "Could not grant the reward.", 500, correlation_id=corr
-        )
-
-
-@frappe.whitelist(methods=["POST"])
-def ad_reward(**kwargs):
-    """G1: +1 topup credit for completing a rewarded ad. 1/user/day."""
-    return _claim_daily_reward("rewarded_ads", "ad_reward", "Rewarded ad bonus credit")
-
-
-@frappe.whitelist(methods=["POST"])
-def share_reward(**kwargs):
-    """G2: +1 topup credit after sharing a generated design. 1/user/day."""
-    return _claim_daily_reward("share_rewards", "share_reward", "Share-to-earn bonus credit")
-
+# Both routes are gone, along with `_claim_daily_reward` and the
+# `rewarded_ads` / `share_rewards` flags. If rewarded ads come back, they
+# need a real AdMob unit AND an SSV callback that grants from Google's
+# signed payload rather than from a client request — the credit must be
+# minted by the callback, never by a route the app can call directly.
+# ============================================================================
 
 @frappe.whitelist(methods=["POST"])
 def dev_grant_credits(**kwargs):
@@ -4115,53 +4138,24 @@ def dev_grant_credits(**kwargs):
         return _error_response("SERVER_ERROR", "Failed to grant credits", 500, correlation_id=corr)
 
 # ===========================================================================
-# CREDIT GATING (PREM-4)
+# CREDIT PRICING (PREM-4)
 # ===========================================================================
-# Wires the credit ledger from PREM-1 into the AI submit pipeline. Behaviour
-# is gated by the `credit_gating` feature flag so the existing free-daily
-# quota stays in force until we flip the switch. Once on, a submit costs:
+# What a submit costs against the credit ledger:
 #
 #   cost = variations * (hd ? 2 : 1)
 #
-# Floor-plan analysis stays free (or limited by the existing daily quota) on
-# both sides — it costs near-zero on the vendor side and is the hook product.
+# This is unconditional. It used to sit behind a `credit_gating` feature flag
+# so the older free-daily-quota model could stay in force until IAP shipped;
+# IAP has shipped, and the flag had become the one row whose absence made
+# every paid generation free — it was never seeded, and a missing row read as
+# "off". The flag is gone.
+#
+# Floor-plan analysis is priced at zero: it costs near-nothing on the vendor
+# side and is the hook product. A debit of 0 bounds nothing, so that tool is
+# held to the per-day free quota instead.
 # ===========================================================================
 
 _CREDIT_HD_MULTIPLIER = 2
-
-
-_CREDIT_GATING_CACHE_KEY = "credit_gating_last_known"
-
-
-def _credit_gating_enabled():
-    """Whether AI submissions are charged against the credit ledger.
-
-    This used to swallow every exception into False — i.e. a transient
-    database hiccup made every paid AI generation free, for as long as the
-    hiccup lasted, with nothing in the logs to say so. Now the last value we
-    successfully read is cached for a day and used as the fallback, and if we
-    have never read it at all the error propagates so the caller can return a
-    503 instead of quietly giving the product away.
-    """
-    try:
-        value = bool(_flag_enabled("credit_gating"))
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "v1.credit_gating_flag")
-        cached = None
-        try:
-            cached = frappe.cache().get_value(_CREDIT_GATING_CACHE_KEY)
-        except Exception:
-            cached = None
-        if cached is None:
-            raise
-        return bool(cached)
-    try:
-        frappe.cache().set_value(
-            _CREDIT_GATING_CACHE_KEY, 1 if value else 0, expires_in_sec=60 * 60 * 24
-        )
-    except Exception:
-        pass
-    return value
 
 
 def _credit_cost_for(tool_id, quality, variations):
@@ -4206,18 +4200,82 @@ def _sha256_hex(value):
     return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
 
+def _attest_device(integrity_token, device_id, binding_doc=None):
+    """Evaluate the device's Play Integrity token and record the verdict.
+
+    Returns {"allow_grant": bool, "reason": str}.
+
+    Fails OPEN on every kind of *our* failure — unconfigured, Google
+    unreachable, a bug in the decode path. An outage on Google's side must not
+    turn into "nobody who installs the app today gets their welcome credits",
+    which is a self-inflicted product outage in exchange for no security: an
+    attacker cannot cause that outage, so failing closed here buys nothing and
+    costs real users. It fails CLOSED only on a verdict that actually came back
+    negative, which is the case attestation exists to catch.
+    """
+    from construction.api import play_integrity
+
+    mode = play_integrity.mode()
+    if mode == play_integrity.MODE_OFF:
+        return {"allow_grant": True, "reason": "OFF"}
+
+    try:
+        result = play_integrity.evaluate(integrity_token, device_id)
+    except play_integrity.PlayIntegrityError as e:
+        frappe.log_error(str(e), "anon_bootstrap.attestation_unavailable")
+        return {"allow_grant": True, "reason": "UNAVAILABLE"}
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "anon_bootstrap.attestation_error")
+        return {"allow_grant": True, "reason": "ERROR"}
+
+    # Record what we saw, whatever the mode. In `audit` this is the whole
+    # point: it is how you find out what the real verdict distribution looks
+    # like before you start withholding anything on the strength of it.
+    if binding_doc is not None:
+        try:
+            frappe.db.set_value(
+                "Anon Device",
+                binding_doc.name,
+                {
+                    "attestation_verdict": play_integrity.summarize(result),
+                    "attested_at": frappe.utils.now_datetime(),
+                    "attestation_mode": mode,
+                },
+                update_modified=False,
+            )
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(), "anon_bootstrap.attestation_record"
+            )
+
+    if mode == play_integrity.MODE_AUDIT:
+        return {"allow_grant": True, "reason": "AUDIT_%s" % result["reason"]}
+
+    # enforce
+    return {"allow_grant": bool(result["passed"]), "reason": result["reason"]}
+
+
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def anon_bootstrap(**kwargs):
     """Create / return the anonymous account owned by this device.
 
-    Body: {"device_id": "<uuid>", "device_secret": "<32+ random chars>"}
-    Returns: {"anon_user_id", "api_key", "api_secret", "created"}
+    Body: {"device_id": "<uuid>",
+           "device_secret": "<32+ random chars>",
+           "integrity_token": "<Play Integrity token>"}   # optional
+    Returns: {"anon_user_id", "api_key", "api_secret", "created",
+              "welcome_granted", "attestation"}
 
     The device generates `device_secret` once, keeps it, and presents it on
     every bootstrap. Only its hash is stored. A caller who knows a
     `device_id` but not its secret gets a 403 and learns nothing — the
     correct response is to generate a fresh device identity, which yields a
     fresh empty account rather than someone else's.
+
+    `integrity_token` is Google's signed statement that this is a genuine,
+    Play-installed copy of the app on a genuine device. It gates the WELCOME
+    CREDIT GRANT, not account creation — see `api/play_integrity.py` for why,
+    and for the off/audit/enforce rollout ladder. Account creation stays open
+    to every caller, including old clients that send no token at all.
     """
     data = _read_json_body()
     if not isinstance(data, dict):
@@ -4246,6 +4304,10 @@ def anon_bootstrap(**kwargs):
             "device_secret must be a 32-256 char client-generated random string",
             400,
         )
+
+    # Optional. Absent on old clients and on devices that cannot attest; both
+    # still get an account.
+    integrity_token = (data.get("integrity_token") or "").strip()
 
     device_hash = _sha256_hex(device_id)
     secret_hash = _sha256_hex(device_secret)
@@ -4351,9 +4413,13 @@ def anon_bootstrap(**kwargs):
         # creation of this device row, and only within the per-IP daily cap, to
         # slow credit farming via rotating device_ids. A failed/denied grant
         # never blocks the auth handshake.
-        if created and _welcome_ip_allowed(ip=client_ip):
+        attestation = _attest_device(integrity_token, device_id, binding_doc)
+
+        welcome_granted = False
+        if created and attestation["allow_grant"] and _welcome_ip_allowed(ip=client_ip):
             try:
                 _grant_welcome_credits(user_name, device_id=device_id)
+                welcome_granted = True
             except Exception:
                 frappe.log_error(frappe.get_traceback(), "anon_bootstrap.welcome_grant")
 
@@ -4363,6 +4429,8 @@ def anon_bootstrap(**kwargs):
             "api_key": api_key,
             "api_secret": api_secret,
             "created": created,
+            "welcome_granted": welcome_granted,
+            "attestation": attestation["reason"],
         }
     except Exception:
         corr = _log_unhandled("v1.anon_bootstrap")
@@ -4383,8 +4451,7 @@ def anon_bootstrap(**kwargs):
 #
 # AUTH-2 server tail: `receipt_token` is validated against the Play
 # Developer API (see play_billing.py) before any grant. Fail-closed when the
-# service account isn't configured; `play_billing_relaxed` in site_config is
-# the local-QA-only escape hatch.
+# service account isn't configured — there is no QA bypass.
 # ===========================================================================
 
 # Authoritative price list — what each Play Console product is worth in
@@ -4457,37 +4524,32 @@ def grant_topup_credits(**kwargs):
         )
 
     # AUTH-2: verify the token against the Play Developer API before granting.
-    # Fail-closed when validation isn't configured (unless the site opted into
-    # play_billing_relaxed for local QA) — an unverified string must never
-    # mint credits.
+    # Fail-closed when validation isn't configured — an unverified string must
+    # never mint credits, and there is no bypass to opt into.
     from construction.api import play_billing
 
-    if play_billing.relaxed_mode():
-        frappe.log_error(
-            f"grant_topup_credits RELAXED grant for {frappe.session.user} ({product_id})",
-            "play_billing.relaxed",
+    play_billing.warn_if_relaxed_configured()
+
+    try:
+        verified = play_billing.verify_product(receipt_token, product_id)
+    except play_billing.PlayBillingError as e:
+        return _error_response(e.code, e.message, e.http_status)
+    if verified["purchase_state"] == play_billing.PRODUCT_STATE_PENDING:
+        return _error_response(
+            "RECEIPT_PENDING",
+            "This purchase is still pending. Credits are granted once it completes.",
+            409,
         )
-    else:
-        try:
-            verified = play_billing.verify_product(receipt_token, product_id)
-        except play_billing.PlayBillingError as e:
-            return _error_response(e.code, e.message, e.http_status)
-        if verified["purchase_state"] == play_billing.PRODUCT_STATE_PENDING:
-            return _error_response(
-                "RECEIPT_PENDING",
-                "This purchase is still pending. Credits are granted once it completes.",
-                409,
-            )
-        if verified["purchase_state"] != play_billing.PRODUCT_STATE_PURCHASED:
-            return _error_response(
-                "RECEIPT_NOT_PURCHASED",
-                "This purchase is not in a purchased state according to Google Play.",
-                400,
-            )
-        # Prefer Play's order id for dedup — it's server-issued and stable
-        # across client retries even if the client mangles its own ids.
-        if verified.get("order_id"):
-            purchase_id = verified["order_id"]
+    if verified["purchase_state"] != play_billing.PRODUCT_STATE_PURCHASED:
+        return _error_response(
+            "RECEIPT_NOT_PURCHASED",
+            "This purchase is not in a purchased state according to Google Play.",
+            400,
+        )
+    # Prefer Play's order id for dedup — it's server-issued and stable across
+    # client retries even if the client mangles its own ids.
+    if verified.get("order_id"):
+        purchase_id = verified["order_id"]
 
     grant_amount = _TOPUP_GRANT_TABLE[product_id]
     dedup_key = _topup_dedup_key(product_id, receipt_token, purchase_id)

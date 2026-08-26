@@ -6,24 +6,20 @@ Site config keys (site_config.json):
     play_billing_service_account_file  absolute path to the service-account
                                        JSON key, OR
     play_billing_service_account_json  the key inlined as a dict
-    play_billing_relaxed               OPTIONAL, default false. When true AND
-                                       validation is NOT configured AND the
-                                       site has developer_mode on, callers may
-                                       fall back to trusting the client.
-                                       Local QA only. The developer_mode
-                                       requirement is deliberate: this flag
-                                       makes every entitlement and every credit
-                                       pack grantable from a made-up string, so
-                                       one line in a production site_config
-                                       would turn receipt validation into
-                                       theatre. A production site has
-                                       developer_mode off, so the escape hatch
-                                       simply cannot open there.
 
-Fail-closed by design: when the service account isn't configured and
-`play_billing_relaxed` is off, `require_configured()` raises and the grant
-endpoints refuse. That closes the trust-the-client hole even before the
-Play Console / service-account setup is done.
+Fail-closed, with no exceptions: when the service account isn't configured,
+`require_configured()` raises and the grant endpoints refuse. There is no
+escape hatch.
+
+There used to be one — `play_billing_relaxed`, which let a developer_mode
+site grant 31 days of Pro and any credit pack from a made-up string. It is
+removed. A key that turns receipt validation into theatre is not worth the
+convenience, and the only thing standing between it and production was an
+operator never copying one line into the wrong site_config.
+
+To exercise purchases locally, use Play Console **license testers**: they
+issue real purchase tokens against real products, so the code under test is
+the code that runs in production.
 """
 
 import frappe
@@ -73,7 +69,6 @@ def _conf():
         "package_name": sc.get("play_billing_package_name"),
         "sa_file": sc.get("play_billing_service_account_file"),
         "sa_json": sc.get("play_billing_service_account_json"),
-        "relaxed": bool(sc.get("play_billing_relaxed")),
     }
 
 
@@ -82,25 +77,20 @@ def is_configured():
     return bool(c["package_name"] and (c["sa_file"] or c["sa_json"]))
 
 
-def relaxed_mode():
-    """True only when validation is unconfigured, the site explicitly opted
-    into the QA fallback, AND the site is a developer_mode site.
+def warn_if_relaxed_configured():
+    """Log if a site still carries the removed `play_billing_relaxed` key.
 
-    See the module docstring: without the developer_mode requirement this one
-    site_config key silently disables receipt validation everywhere, and
-    nothing in the app's behaviour would look different until the revenue
-    report did.
+    The key no longer does anything. Saying so once is worth more than silence:
+    whoever set it believed validation was being skipped, and should find out
+    that it is not, rather than discovering it through a support ticket.
     """
-    if not (not is_configured() and _conf()["relaxed"]):
-        return False
-    if not frappe.conf.get("developer_mode"):
+    if frappe.get_site_config().get("play_billing_relaxed"):
         frappe.log_error(
-            "play_billing_relaxed is set on a NON-developer_mode site and was "
-            "ignored. Configure play_billing_service_account_* instead.",
-            "play_billing.relaxed_refused",
+            "play_billing_relaxed is set but no longer exists. Receipt "
+            "validation is always enforced. Remove the key from site_config; "
+            "use Play Console license testers for QA.",
+            "play_billing.relaxed_removed",
         )
-        return False
-    return True
 
 
 def require_configured():

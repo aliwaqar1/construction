@@ -7,4 +7,4 @@
 construction.patches.v2.seed_ai_tool_configs
 construction.patches.v2.seed_estimator_flags
 construction.patches.v2.seed_basement_rates
-construction.patches.v2.seed_reward_flags
+construction.patches.v2.remove_dead_flags

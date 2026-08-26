@@ -56,6 +56,18 @@ def run_job(name):
         frappe.log_error(traceback.format_exc(), f"ai_worker.load_failed:{name}")
         return
 
+    if doc.status not in ("queued", "running"):
+        # The watchdog (or a failed submit) already terminated and refunded
+        # this job. Running it now would spend real vendor money on work the
+        # user has been paid back for — and deliver an image they were told
+        # they would not get, after they had already re-submitted at their own
+        # cost.
+        frappe.log_error(
+            f"job {name} was already {doc.status}; skipping execution",
+            "ai_worker.already_terminal",
+        )
+        return
+
     doc.status = "running"
     doc.started_at = now_datetime()
     doc.save(ignore_permissions=True)
@@ -118,12 +130,12 @@ def run_job(name):
     # ref_name) pair so re-running this is safe.
     if doc.status == "failed":
         try:
-            from construction.api.v1 import _refund_credits, _credit_gating_enabled
+            from construction.api.v1 import _refund_job_credits, _credit_gating_enabled
             if _credit_gating_enabled():
-                _refund_credits(
+                _refund_job_credits(
                     doc.user,
-                    ref_doctype="AI Job",
-                    ref_name=doc.name,
+                    doc.name,
+                    doc.idempotency_key,
                     reason=f"AI job failed: {doc.error_code or 'unknown'}",
                 )
                 frappe.db.commit()
@@ -180,15 +192,25 @@ _CB_COUNTED_CODES = {
 
 
 def _circuit_note_failure(tool_id, code):
+    """Count a vendor failure and, past the threshold, take THIS tool offline.
+
+    Two changes from the original. The counter is an atomic INCR — the
+    get-then-set form undercounted exactly when failures were arriving fastest,
+    which is when it mattered. And the trip is scoped to the failing tool
+    rather than the global kill switch: six failures on one tool used to take
+    the whole product offline, subscribers included, and their credits with it.
+    """
     if code not in _CB_COUNTED_CODES:
         return
     try:
         cache = frappe.cache()
-        key = f"ai_cb:{tool_id}"
-        current = int(cache.get_value(key) or 0) + 1
-        cache.set_value(key, current, expires_in_sec=_CB_WINDOW_SEC)
+        rkey = cache.make_key(f"ai_cb2:{tool_id}")
+        current = int(cache.incrby(rkey, 1))
+        if current == 1:
+            cache.expire(rkey, _CB_WINDOW_SEC)
         if current >= _CB_THRESHOLD:
-            ai_cfg.trip_kill_switch(
+            ai_cfg.trip_tool_breaker(
+                tool_id,
                 hours=_CB_TRIP_HOURS,
                 reason=(
                     f"Circuit breaker: {current} vendor failures for "
@@ -196,14 +218,15 @@ def _circuit_note_failure(tool_id, code):
                     f"(last: {code})"
                 ),
             )
-            cache.delete_value(key)
+            cache.delete(rkey)
     except Exception:
         frappe.log_error(traceback.format_exc(), "ai_worker.circuit_breaker")
 
 
 def _circuit_note_success(tool_id):
     try:
-        frappe.cache().delete_value(f"ai_cb:{tool_id}")
+        cache = frappe.cache()
+        cache.delete(cache.make_key(f"ai_cb2:{tool_id}"))
     except Exception:
         pass
 
@@ -238,9 +261,18 @@ def _http_error(status, vendor, body_snippet):
     )
 
 
-def _post_json_with_retry(url, body, timeout, vendor, retries=2, headers=None):
-    """POST returning the 200 Response; retries timeouts/429/5xx with a short
-    backoff, fails fast on non-retryable 4xx (B1)."""
+def _post_json_with_retry(url, body, timeout, vendor, retries=2, headers=None,
+                          retry_timeouts=True):
+    """POST returning the 200 Response; retries 429/5xx with a short backoff,
+    fails fast on non-retryable 4xx (B1).
+
+    `retry_timeouts=False` for anything that BILLS PER CALL. A client-side
+    timeout cannot distinguish a slow success from a failure: the vendor may
+    well have finished the generation and charged for it. Retrying such a call
+    three times against four variations is up to twelve billable generations
+    for one credit — so for image generation a timeout is terminal, and the
+    user is refunded through the normal failure path.
+    """
     last_err = None
     for attempt in range(retries + 1):
         try:
@@ -250,6 +282,8 @@ def _post_json_with_retry(url, body, timeout, vendor, retries=2, headers=None):
                 "VENDOR_TIMEOUT", _VENDOR_USER_MESSAGES["VENDOR_TIMEOUT"],
                 detail=f"{vendor} timeout: {e}",
             )
+            if not retry_timeouts:
+                raise last_err
         except requests.RequestException as e:
             last_err = _VendorError(
                 "VENDOR_NETWORK", _VENDOR_USER_MESSAGES["VENDOR_NETWORK"],
@@ -1096,15 +1130,38 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
     def _call_once(idx):
         body = json.loads(json.dumps(body_template))
         body["generationConfig"]["seed"] = 1000 + idx * 17
-        resp = _post_json_with_retry(url, body, timeout=120, vendor="Gemini")
+        # retry_timeouts=False: each call is a billable generation.
+        resp = _post_json_with_retry(
+            url, body, timeout=120, vendor="Gemini", retry_timeouts=False
+        )
         data = resp.json()
         _check_gemini_safety(data)
         return data
 
+    # Collect per-future rather than with `ex.map`, which re-raises the first
+    # exception it meets and throws away every sibling result — so one late
+    # failure used to discard three images the operator had already paid for.
     results = []
+    first_error = None
     with ThreadPoolExecutor(max_workers=min(4, variations)) as ex:
-        for r in ex.map(_call_once, range(variations)):
-            results.append(r)
+        futures = [ex.submit(_call_once, i) for i in range(variations)]
+        for fut in futures:
+            try:
+                results.append(fut.result())
+            except Exception as e:  # noqa: BLE001 - re-raised below if total
+                if first_error is None:
+                    first_error = e
+
+    if not results:
+        # Nothing survived — this is an ordinary job failure and the standard
+        # refund path applies.
+        raise first_error
+    if first_error is not None:
+        frappe.log_error(
+            f"job {doc.name}: {len(results)}/{variations} variations succeeded; "
+            f"first error: {first_error}",
+            "ai_worker.partial_variations",
+        )
 
     images = []
     total_tokens_in = 0
@@ -1112,7 +1169,10 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
     # Free-tier output is watermarked server-side so the raw, clean image is
     # never reachable — even by the owner reading the private file URL. Premium
     # output is delivered clean.
-    watermark = not ai_cfg.is_premium(doc.user)
+    # F-42: the entitlement the job was PRICED with, frozen at submit. Re-deriving
+    # it here meant a subscription lapsing while the job sat in the queue burned a
+    # watermark into an image the user had paid full Pro price for.
+    watermark = not int(getattr(doc, "charged_as_premium", 0) or 0)
     for i, data in enumerate(results):
         try:
             cand = data["candidates"][0]
@@ -1145,6 +1205,23 @@ def _gemini_image_edit(doc, model, prompt, image_bytes, mime,
         usage = data.get("usageMetadata") or {}
         total_tokens_in += int(usage.get("promptTokenCount", 0))
         total_tokens_out += int(usage.get("candidatesTokenCount", 0))
+
+    # The user was charged for `variations`. If fewer came back, give the
+    # difference back rather than quietly keeping it.
+    if len(images) < variations:
+        try:
+            from construction.api.v1 import (
+                _credit_gating_enabled, _refund_partial_credits,
+            )
+            if _credit_gating_enabled():
+                _refund_partial_credits(
+                    doc.user, "AI Job", doc.name,
+                    delivered=len(images), paid_for=variations,
+                )
+        except Exception:
+            frappe.log_error(
+                traceback.format_exc(), f"ai_worker.partial_refund:{doc.name}"
+            )
 
     doc.model = model
     doc.tokens_input = total_tokens_in
@@ -1265,7 +1342,10 @@ def _fal_image_edit(doc, model, prompt, image_bytes, mime,
             detail=f"fal result had no images: {str(result)[:300]}",
         )
 
-    watermark = not ai_cfg.is_premium(doc.user)
+    # F-42: the entitlement the job was PRICED with, frozen at submit. Re-deriving
+    # it here meant a subscription lapsing while the job sat in the queue burned a
+    # watermark into an image the user had paid full Pro price for.
+    watermark = not int(getattr(doc, "charged_as_premium", 0) or 0)
     images = []
     for i, entry in enumerate(remote_images):
         img_url = entry.get("url")

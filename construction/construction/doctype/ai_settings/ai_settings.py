@@ -196,8 +196,90 @@ def is_master_enabled():
     return True
 
 
+# A tripped TOOL is paused in the cache rather than written to the config
+# row: it must expire on its own, and it must not require an admin to
+# remember to turn it back on.
+_TOOL_TRIP_KEY = "ai_tool_tripped"
+_BUDGET_PAUSE_KEY = "ai_budget_paused"
+
+
+def trip_tool_breaker(tool_id, hours, reason=""):
+    """Take ONE tool offline for `hours`.
+
+    The circuit breaker counts failures per tool and then used to trip the
+    GLOBAL kill switch, so six failures on the least-used tool took the entire
+    product offline — including for subscribers, whose credits then became
+    unspendable because the gate sits upstream of the debit. Scope the
+    response to the thing that is actually failing.
+    """
+    try:
+        frappe.cache().set_value(
+            f"{_TOOL_TRIP_KEY}:{tool_id}", reason or "1",
+            expires_in_sec=int(max(1, hours * 3600)),
+        )
+    except Exception:
+        # Cache down — fall back to the global switch rather than keep calling
+        # a vendor that is failing.
+        trip_kill_switch(hours=hours, reason=f"[cache down] {reason}")
+        return
+    frappe.log_error(
+        f"AI tool {tool_id} tripped for {hours}h. Reason: {reason}",
+        "ai_settings.tool_breaker",
+    )
+
+
+def is_tool_tripped(tool_id):
+    """True while `tool_id` is inside its circuit-breaker cool-down."""
+    try:
+        return bool(frappe.cache().get_value(f"{_TOOL_TRIP_KEY}:{tool_id}"))
+    except Exception:
+        return False
+
+
+def clear_tool_breaker(tool_id):
+    try:
+        frappe.cache().delete_value(f"{_TOOL_TRIP_KEY}:{tool_id}")
+    except Exception:
+        pass
+
+
+def pause_free_tier(scope, hours, reason=""):
+    """Stop FREE work for `hours` because a budget cap was reached.
+
+    Not the global kill switch. A budget breach is a cost problem; killing the
+    product converts it into an availability problem for people who have
+    already paid, and their credits become unspendable. Free generations are
+    what the cap exists to bound, so free generations are what stop.
+    """
+    try:
+        frappe.cache().set_value(
+            f"{_BUDGET_PAUSE_KEY}:{scope}", reason or "1",
+            expires_in_sec=int(max(1, hours * 3600)),
+        )
+    except Exception:
+        trip_kill_switch(hours=hours, reason=f"[cache down] {reason}")
+        return
+    frappe.log_error(
+        f"Free-tier AI paused for {hours}h ({scope}). Reason: {reason}",
+        "ai_settings.budget_paused",
+    )
+
+
+def free_tier_paused(scope):
+    try:
+        return bool(frappe.cache().get_value(f"{_BUDGET_PAUSE_KEY}:{scope}"))
+    except Exception:
+        return False
+
+
 def trip_kill_switch(hours, reason=""):
-    """Auto-disable AI for the next [hours]. Called when a budget cap is hit."""
+    """Auto-disable AI for the next [hours], GLOBALLY.
+
+    Reserve this for situations where continuing to serve anyone is the wrong
+    answer — a vendor outage the cache can't scope, or a manual intervention.
+    Budget breaches use `pause_free_tier` and per-tool failures use
+    `trip_tool_breaker`; neither should take the product away from subscribers.
+    """
     from datetime import timedelta
     from frappe.utils import now_datetime
 

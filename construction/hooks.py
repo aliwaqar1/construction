@@ -160,6 +160,11 @@ scheduler_events = {
         # E1: retention window for uploaded source photos (privacy) — deletes
         # source/mask/ref uploads on old terminal jobs, keeps saved designs.
         "construction.api.v1.cleanup_ai_source_uploads",
+        # Re-check live Play entitlements and revoke the ones Play no longer
+        # honours. The push half is the `play_rtdn` endpoint; this is the
+        # backstop, because a Pub/Sub subscription can be missed, misconfigured
+        # or silently removed and nothing else would ever notice a refund.
+        "construction.api.v1.revalidate_premium_subscriptions",
     ],
     "weekly": [
         # B5: golden-pair drift checks. No-ops unless site_config sets

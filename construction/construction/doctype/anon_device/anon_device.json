@@ -1,0 +1,88 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:device_hash",
+ "creation": "2026-08-25 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "device_hash",
+  "user",
+  "secret_hash",
+  "created_ip",
+  "last_seen_at",
+  "bootstrap_count"
+ ],
+ "fields": [
+  {
+   "fieldname": "device_hash",
+   "fieldtype": "Data",
+   "label": "Device Hash",
+   "length": 64,
+   "reqd": 1,
+   "unique": 1,
+   "in_list_view": 1,
+   "description": "sha256 of the client-supplied device_id. The raw id is never stored."
+  },
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "options": "User",
+   "label": "User",
+   "reqd": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "description": "The anonymous account this device owns."
+  },
+  {
+   "fieldname": "secret_hash",
+   "fieldtype": "Data",
+   "label": "Secret Hash",
+   "length": 64,
+   "reqd": 1,
+   "description": "sha256 of the client-held device_secret. Presenting the matching secret is what proves ownership of this account at re-bootstrap."
+  },
+  {
+   "fieldname": "created_ip",
+   "fieldtype": "Data",
+   "label": "Created From IP",
+   "length": 45
+  },
+  {
+   "fieldname": "last_seen_at",
+   "fieldtype": "Datetime",
+   "label": "Last Seen At"
+  },
+  {
+   "fieldname": "bootstrap_count",
+   "fieldtype": "Int",
+   "label": "Bootstrap Count",
+   "default": "0",
+   "description": "How many times this device has re-fetched its keys. A sudden jump is worth investigating."
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-08-25 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "construction",
+ "name": "Anon Device",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 0
+}

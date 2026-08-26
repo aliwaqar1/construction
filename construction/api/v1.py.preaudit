@@ -10,11 +10,9 @@ Frappe URLs (all allow_guest):
 
 import hashlib
 import json
-import re
 import sys
 import traceback
 import uuid
-from contextlib import contextmanager
 
 import frappe
 
@@ -196,23 +194,25 @@ ESTIMATE_RATE_LIMIT_PER_MIN = 60
 
 def _estimate_rate_limited():
     # True when the caller exceeded ESTIMATE_RATE_LIMIT_PER_MIN. Keyed by
-    # session user, falling back to the client IP for guests. Fails OPEN: a
-    # cache outage must never take the estimate endpoint down with it, and
-    # this endpoint spends no vendor money.
-    #
-    # `_client_ip()` rather than `frappe.local.request_ip`: the latter is taken
-    # from a caller-supplied `X-Forwarded-For` with no trusted-proxy list, so
-    # every guest could pick their own bucket and the limit bounded nothing.
+    # session user, falling back to request IP for guests. Fails OPEN: a
+    # cache outage must never take the estimate endpoint down with it.
     try:
         user = getattr(getattr(frappe, "session", None), "user", None)
         if user and user != "Guest":
             ident = user
         else:
-            ident = _client_ip() or "unknown"
-        current = _counter_incr(f"est_rl2:{ident}", 60)
-        if current is None:
-            return False
-        return current > ESTIMATE_RATE_LIMIT_PER_MIN
+            ident = getattr(frappe.local, "request_ip", None) or "unknown"
+        key = f"est_rl:{ident}"
+        cache = frappe.cache()
+        current = cache.get_value(key) or 0
+        try:
+            current = int(current)
+        except (TypeError, ValueError):
+            current = 0
+        if current >= ESTIMATE_RATE_LIMIT_PER_MIN:
+            return True
+        cache.set_value(key, current + 1, expires_in_sec=60)
+        return False
     except Exception:
         return False
 
@@ -388,27 +388,20 @@ def config(app_version=None, device_id=None):
         # `premium_active` is PER-USER server truth, not a rollout flag: the
         # client keys every Pro gate (HD, variations, custom rates, PDF quota,
         # ad removal) off this. The endpoint is allow_guest, but the app sends
-        # its anon/session token, so frappe resolves the real caller here.
-        #
-        # A `premium_active` Feature Flag ROW is ignored here on purpose. It
-        # used to OR into this value as a "global QA override", which meant one
-        # enabled row handed client-side Pro to every user of the app — a
-        # single mis-click in the desk UI giving away the product. Entitlement
-        # comes from the premium table and nowhere else.
-        flags.pop("premium_active", None)
+        # its anon/session token, so frappe resolves the real caller here. A
+        # `premium_active` Feature Flag row, if present AND enabled, acts as a
+        # global QA override on top — never enable it in production.
         try:
             user = frappe.session.user
             if user and user != "Guest":
                 from construction.construction.doctype.ai_settings import (
                     ai_settings as _ai_cfg,
                 )
-                flags["premium_active"] = bool(_ai_cfg.is_premium(user))
-            else:
-                flags["premium_active"] = False
+                flags["premium_active"] = bool(flags.get("premium_active")) or _ai_cfg.is_premium(user)
         except Exception:
             # Entitlement lookup must never break config delivery; the client
             # falls back to its cached/default (non-premium) value.
-            flags["premium_active"] = False
+            pass
 
         return {
             "flags": flags,
@@ -429,41 +422,14 @@ def config(app_version=None, device_id=None):
 # ============================================================================
 
 
-def _user_keys(user, rotate=False):
-    """Return (api_key, api_secret) for a User, generating them on demand.
-
-    `rotate` defaults to False. It used to be unconditional, which turned any
-    successful re-issue into a permanent, irreversible lockout of whoever held
-    the previous secret — so a stolen re-issue didn't just clone an account,
-    it took it away from its owner with no path back. Existing secrets are now
-    read back out of the password store and returned unchanged; a new one is
-    minted only when the account has none, or when a caller explicitly asks
-    for a rotation.
-    """
-    from frappe.utils.password import get_decrypted_password
-
+def _user_keys(user):
+    """Return (api_key, api_secret) for a User, generating them on demand."""
     user_doc = frappe.get_doc("User", user)
-    dirty = False
     if not user_doc.api_key:
         user_doc.api_key = frappe.generate_hash(length=15)
-        dirty = True
-
-    api_secret = None
-    if not rotate:
-        try:
-            api_secret = get_decrypted_password(
-                "User", user, fieldname="api_secret", raise_exception=False
-            )
-        except Exception:
-            api_secret = None
-
-    if not api_secret:
-        api_secret = frappe.generate_hash(length=15)
-        user_doc.api_secret = api_secret
-        dirty = True
-
-    if dirty:
-        user_doc.save(ignore_permissions=True)
+    api_secret = frappe.generate_hash(length=15)
+    user_doc.api_secret = api_secret
+    user_doc.save(ignore_permissions=True)
     return user_doc.api_key, api_secret
 
 
@@ -500,9 +466,7 @@ def login(usr=None, pwd=None):
         corr = _log_unhandled("v1.login")
         return _error_response("SERVER_ERROR", "Login failed", 500, correlation_id=corr)
 
-    # Password login is an explicit, authenticated credential exchange, so
-    # rotating here is intentional: it invalidates any previously issued token.
-    api_key, api_secret = _user_keys(frappe.session.user, rotate=True)
+    api_key, api_secret = _user_keys(frappe.session.user)
     return {
         "user": frappe.session.user,
         "api_key": api_key,
@@ -582,67 +546,9 @@ def me():
 # ============================================================================
 
 
-def _require_sync_entitlement():
-    """Cloud sync is sold as a Pro feature; enforce that here, not only in the
-    client.
-
-    The client gates on its own `premium_active` flag, and until F-51 was fixed
-    the sync path never ran at all — so nothing had ever exercised the server
-    side of the gate. Now that it does run, the client flag would be the only
-    thing standing between a tampered build and free cloud storage.
-
-    `server_save` mirrors the client's QA/dogfood override so the two agree.
-    """
-    if ai_cfg.is_premium(frappe.session.user):
-        return None
-    try:
-        if _flag_enabled("server_save"):
-            return None
-    except Exception:
-        pass
-    return _error_response(
-        "PREMIUM_REQUIRED",
-        "Cloud sync is a Pro feature. Subscribe to back up across devices.",
-        402,
-    )
-
-
 def _require_auth():
     if frappe.session.user == "Guest":
         frappe.throw("Authentication required", frappe.AuthenticationError)
-
-
-def _client_ip():
-    """Best-available client IP, trusting only as many proxy hops as the site
-    actually has in front of it.
-
-    Frappe fills `frappe.local.request_ip` from `X-Forwarded-For`
-    unconditionally, with no trusted-proxy list — so any caller can set it to
-    whatever they like, which silently nullifies every IP-keyed control built
-    on top of it. We trust exactly `trusted_proxy_hops` entries from the RIGHT
-    of the header (site_config; default 1, the usual single nginx) and fall
-    back to the socket peer whenever the header can't account for them.
-
-    Set `trusted_proxy_hops: 0` in site_config when the app is served directly
-    with nothing in front of it.
-    """
-    req = getattr(frappe, "request", None)
-    if req is None:
-        return None
-    peer = getattr(req, "remote_addr", None)
-    try:
-        hops = int(frappe.get_site_config().get("trusted_proxy_hops", 1))
-    except (TypeError, ValueError):
-        hops = 1
-    if hops <= 0:
-        return peer
-    chain = [p.strip() for p in (req.headers.get("X-Forwarded-For") or "").split(",") if p.strip()]
-    idx = len(chain) - hops
-    if idx < 0:
-        # The caller sent fewer hops than our own proxies are supposed to add,
-        # so the header is entirely caller-supplied. Ignore it.
-        return peer
-    return chain[idx]
 
 
 def _estimate_to_dict(name):
@@ -666,31 +572,15 @@ def _estimate_to_dict(name):
 
 
 def _read_json_body():
-    """The request BODY — JSON when the client sent JSON, otherwise the posted
-    form fields. Returns None when a JSON body was announced but is malformed.
-
-    Deliberately does not fall back to `frappe.local.form_dict`: Frappe merges
-    query-string arguments into that dict, so `?receipt=...` on a GET was
-    indistinguishable from a field in a POST body. Anything that decides
-    whether to move money has to know which of the two it is looking at.
-    """
-    req = getattr(frappe, "request", None)
-    if req is None:
-        return frappe.local.form_dict if frappe.local.form_dict else {}
-    if req.is_json:
+    if frappe.request and frappe.request.is_json:
         try:
-            raw = req.data
+            raw = frappe.request.data
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             return frappe.parse_json(raw) or {}
         except Exception:
             return None
-    try:
-        if req.form:
-            return dict(req.form)
-    except Exception:
-        pass
-    return {}
+    return frappe.local.form_dict if frappe.local.form_dict else {}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -700,10 +590,6 @@ def save_estimate(**kwargs):
         _require_auth()
     except frappe.AuthenticationError:
         return _error_response("UNAUTHORIZED", "Authentication required", 401)
-
-    gate = _require_sync_entitlement()
-    if gate is not None:
-        return gate
 
     data = _read_json_body()
     if data is None:
@@ -852,10 +738,6 @@ def sync_estimates(**kwargs):
         _require_auth()
     except frappe.AuthenticationError:
         return _error_response("UNAUTHORIZED", "Authentication required", 401)
-
-    gate = _require_sync_entitlement()
-    if gate is not None:
-        return gate
 
     data = _read_json_body()
     if data is None:
@@ -1015,89 +897,52 @@ def _flag_enabled(key):
     return bool(enabled)
 
 
-def _counter_incr(key, ttl_seconds):
-    """Atomically bump a Redis counter and return its new value.
-
-    The previous get-then-set form was a read-modify-write across a network
-    round trip: N concurrent requests all read the same value and all wrote
-    the same value + 1, so a limit of 5 admitted as many requests as the
-    client could open at once. `INCR` is atomic server-side, so the Nth caller
-    genuinely sees N. Raw redis commands need the key namespaced by hand —
-    `set_value` does that for us, `incrby` does not — and the counter keys are
-    deliberately distinct from any `set_value` key because those values are
-    pickled and would blow up an INCR.
-
-    Returns None when the cache is unreachable so callers can decide whether
-    that means allow or deny; there is no safe universal default here.
-    """
-    try:
-        cache = frappe.cache()
-        rkey = cache.make_key(key)
-        current = cache.incrby(rkey, 1)
-        if int(current) == 1:
-            cache.expire(rkey, int(ttl_seconds))
-        return int(current)
-    except Exception:
-        return None
-
-
-def _counter_decr(key):
-    """Give back a slot taken by `_counter_incr` (compensating a rejected or
-    failed request). Best-effort — a lost decrement only costs the user one
-    slot until the window rolls."""
-    try:
-        cache = frappe.cache()
-        cache.decrby(cache.make_key(key), 1)
-    except Exception:
-        pass
-
-
 def _rate_limit_check(user, tool_id, limit_per_min):
     if not limit_per_min or limit_per_min <= 0:
         return True
-    current = _counter_incr(f"ai_rl2:{tool_id}:{user}", 60)
-    if current is None:
-        # Cache down. This limiter exists to stop abusive bursts, not to gate
-        # money (the credit ledger does that), so a Redis outage should not
-        # take the product offline.
-        return True
-    return current <= limit_per_min
+    key = f"ai_rl:{tool_id}:{user}"
+    cache = frappe.cache()
+    current = cache.get_value(key) or 0
+    try:
+        current = int(current)
+    except (TypeError, ValueError):
+        current = 0
+    if current >= limit_per_min:
+        return False
+    cache.set_value(key, current + 1, expires_in_sec=60)
+    return True
 
 
-def _free_quota_key(user):
-    from frappe.utils import nowdate
-    return f"ai_free2:{user}:{nowdate()}"
-
-
-def _free_quota_claim(user, tool_id, free_daily_limit):
-    """Claim one slot of today's free quota for a non-premium user.
-
-    Returns (ok, remaining_today). This *reserves* the slot up front rather
-    than counting it after the job is enqueued: the old order (check, run,
-    then increment) let concurrent submits all pass the check before any of
-    them incremented, and a crash between the two lost the count entirely.
-    Callers must call `_free_quota_release` if they end up not running the
-    job, so a rejected submit doesn't burn the user's day.
-
-    Premium bypasses the cap.
-    """
+def _free_quota_check(user, tool_id, free_daily_limit):
+    """Per-user per-day generation counter for non-premium users.
+    Returns (ok: bool, remaining_today: int). Premium bypasses the cap."""
     if not free_daily_limit or free_daily_limit <= 0:
         return True, -1
     if ai_cfg.is_premium(user):
         return True, -1
-    current = _counter_incr(_free_quota_key(user), 60 * 60 * 36)
-    if current is None:
-        # Cache down: this counter is the only bound on free generations, and
-        # it is spending real vendor money. Fail closed.
-        return False, 0
-    if current > free_daily_limit:
-        _counter_decr(_free_quota_key(user))
+    from frappe.utils import nowdate
+    key = f"ai_free:{user}:{nowdate()}"
+    cache = frappe.cache()
+    current = cache.get_value(key) or 0
+    try:
+        current = int(current)
+    except (TypeError, ValueError):
+        current = 0
+    if current >= free_daily_limit:
         return False, 0
     return True, free_daily_limit - current
 
 
-def _free_quota_release(user):
-    _counter_decr(_free_quota_key(user))
+def _free_quota_increment(user):
+    from frappe.utils import nowdate
+    key = f"ai_free:{user}:{nowdate()}"
+    cache = frappe.cache()
+    current = cache.get_value(key) or 0
+    try:
+        current = int(current)
+    except (TypeError, ValueError):
+        current = 0
+    cache.set_value(key, current + 1, expires_in_sec=60 * 60 * 36)
 
 
 def _canonical_request_hash(payload):
@@ -1105,74 +950,20 @@ def _canonical_request_hash(payload):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _worst_case_cost_cents(tool_id):
-    """The tool's own per-job ceiling, for pricing work that hasn't billed yet."""
-    try:
-        return int(ai_cfg.get_job_config(tool_id).get("max_cost_cents") or 0) or 25
-    except Exception:
-        return 25
-
-
 def _spend_in_window(tool_id, since):
-    """Vendor spend attributable to this window, INCLUDING work in flight.
-
-    Counting only `completed_at` made the cap blind to precisely the spend it
-    exists to bound: a burst of submits all pass the check because none of them
-    has finished yet, all of them run, and the bill lands afterwards. In-flight
-    jobs are priced at the tool's `max_cost_cents` ceiling — the honest worst
-    case, and the number a cap should be reasoning about.
-    """
     filters = {"completed_at": [">=", since]}
     if tool_id:
         filters["job_type"] = tool_id
     rows = frappe.get_all(
         "AI Job", filters=filters, fields=["cost_cents"], limit_page_length=0
     )
-    spent = sum((r.get("cost_cents") or 0) for r in rows)
-
-    inflight_filters = {"status": ["in", ["queued", "running"]]}
-    if tool_id:
-        inflight_filters["job_type"] = tool_id
-    inflight = frappe.get_all(
-        "AI Job", filters=inflight_filters, fields=["job_type"], limit_page_length=0
-    )
-    ceilings = {}
-    for r in inflight:
-        jt = r.get("job_type")
-        if jt not in ceilings:
-            ceilings[jt] = _worst_case_cost_cents(jt)
-        spent += ceilings[jt]
-    return spent
+    return sum((r.get("cost_cents") or 0) for r in rows)
 
 
-def _budget_stop(scope, hours, reason, is_premium, message):
-    """Apply a budget breach and decide whether THIS caller is stopped by it.
-
-    Free work pauses; a subscriber or a credit-holder keeps going, because
-    they have already paid for the generation they are asking for and the
-    breach is the operator's problem to price, not theirs to absorb.
-    """
-    ai_cfg.pause_free_tier(scope, hours, reason)
-    if is_premium:
-        return None
-    return _error_response("BUDGET_EXCEEDED", message, 429)
-
-
-def _check_budgets(tool_id, cfg, is_premium=False):
+def _check_budgets(tool_id, cfg):
     from frappe.utils import add_to_date, now_datetime
 
     now = now_datetime()
-
-    # Already paused from an earlier breach in this window — no need to
-    # re-scan the job table to find out.
-    for scope in (tool_id, "global"):
-        if ai_cfg.free_tier_paused(scope) and not is_premium:
-            return _error_response(
-                "BUDGET_EXCEEDED",
-                "Free AI generations have paused for now. "
-                "Subscribe or top up to keep going.",
-                429,
-            )
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = day_start.replace(day=1)
 
@@ -1182,28 +973,28 @@ def _check_budgets(tool_id, cfg, is_premium=False):
     if job_daily:
         spent = _spend_in_window(tool_id, day_start)
         if spent >= job_daily:
-            err = _budget_stop(
-                tool_id, 24,
-                f"{tool_id} daily budget exceeded ({spent}/{job_daily}c)",
-                is_premium,
-                "Free AI generations have paused for today. "
-                "Subscribe or top up to keep going.",
+            ai_cfg.trip_kill_switch(
+                hours=24,
+                reason=f"{tool_id} daily budget exceeded ({spent}/{job_daily}c)",
             )
-            if err is not None:
-                return err
+            return _error_response(
+                "BUDGET_EXCEEDED",
+                "Daily AI budget reached. Try again tomorrow.",
+                429,
+            )
     if job_monthly:
         spent = _spend_in_window(tool_id, month_start)
         if spent >= job_monthly:
             hours = max(1, int((add_to_date(month_start, months=1) - now).total_seconds() // 3600))
-            err = _budget_stop(
-                tool_id, hours,
-                f"{tool_id} monthly budget exceeded ({spent}/{job_monthly}c)",
-                is_premium,
-                "Free AI generations have paused for this month. "
-                "Subscribe or top up to keep going.",
+            ai_cfg.trip_kill_switch(
+                hours=hours,
+                reason=f"{tool_id} monthly budget exceeded ({spent}/{job_monthly}c)",
             )
-            if err is not None:
-                return err
+            return _error_response(
+                "BUDGET_EXCEEDED",
+                "Monthly AI budget reached. Try again next month.",
+                429,
+            )
 
     settings = ai_cfg.get_settings()
     g_daily = settings.global_daily_budget_cents or 0
@@ -1212,28 +1003,20 @@ def _check_budgets(tool_id, cfg, is_premium=False):
     if g_daily:
         spent = _spend_in_window(None, day_start)
         if spent >= g_daily:
-            err = _budget_stop(
-                "global", 24,
-                f"Global daily budget exceeded ({spent}/{g_daily}c)",
-                is_premium,
-                "Free AI generations have paused for today. "
-                "Subscribe or top up to keep going.",
+            ai_cfg.trip_kill_switch(
+                hours=24,
+                reason=f"Global daily budget exceeded ({spent}/{g_daily}c)",
             )
-            if err is not None:
-                return err
+            return _error_response("BUDGET_EXCEEDED", "Daily AI budget reached.", 429)
     if g_monthly:
         spent = _spend_in_window(None, month_start)
         if spent >= g_monthly:
             hours = max(1, int((add_to_date(month_start, months=1) - now).total_seconds() // 3600))
-            err = _budget_stop(
-                "global", hours,
-                f"Global monthly budget exceeded ({spent}/{g_monthly}c)",
-                is_premium,
-                "Free AI generations have paused for this month. "
-                "Subscribe or top up to keep going.",
+            ai_cfg.trip_kill_switch(
+                hours=hours,
+                reason=f"Global monthly budget exceeded ({spent}/{g_monthly}c)",
             )
-            if err is not None:
-                return err
+            return _error_response("BUDGET_EXCEEDED", "Monthly AI budget reached.", 429)
 
     return None
 
@@ -1299,48 +1082,6 @@ def _strip_image_metadata(content):
             "We couldn't read that image. Please upload a JPEG, PNG, or WebP photo.",
             400,
         )
-
-
-def _submit_preflight(tool_id):
-    """Cheap gate to run BEFORE any upload is persisted.
-
-    Uploads were being written to disk — and left there — before authentication
-    was even checked, so an unauthenticated caller could fill the disk 10 MB at
-    a time and nothing ever swept the orphans. This answers the questions that
-    don't need the request body: is the caller real, is the tool live, are they
-    inside their rate limit. The authoritative checks still happen under the
-    ledger lock in `_ai_submit`.
-
-    Returns an error response, or None to proceed.
-    """
-    try:
-        _require_auth()
-    except frappe.AuthenticationError:
-        return _error_response("UNAUTHORIZED", "Authentication required", 401)
-    if not ai_cfg.is_master_enabled():
-        return _error_response("AI_DISABLED", "AI is currently disabled", 503)
-    flag = _AI_FLAGS.get(tool_id)
-    if not flag or not _flag_enabled(flag):
-        return _error_response(
-            "AI_DISABLED", f"AI tool {tool_id} is currently unavailable", 503
-        )
-    if ai_cfg.is_tool_tripped(tool_id):
-        return _error_response(
-            "AI_DISABLED",
-            "This tool is briefly unavailable while we recover. Please try again shortly.",
-            503,
-        )
-    return None
-
-
-def _discard_uploads(*urls):
-    """Delete private uploads belonging to a submit that never became a job."""
-    for url in urls:
-        if url and isinstance(url, str):
-            try:
-                _delete_private_file(url)
-            except Exception:
-                frappe.log_error(frappe.get_traceback(), "v1.discard_uploads")
 
 
 def _save_uploaded_file(field_name):
@@ -1463,13 +1204,6 @@ def _ai_submit(tool_id, body, extra_payload):
             503,
         )
 
-    if ai_cfg.is_tool_tripped(tool_id):
-        return _error_response(
-            "AI_DISABLED",
-            "This tool is briefly unavailable while we recover. Please try again shortly.",
-            503,
-        )
-
     try:
         cfg = ai_cfg.get_job_config(tool_id)
     except ValueError:
@@ -1531,30 +1265,6 @@ def _ai_submit(tool_id, body, extra_payload):
             "Idempotency-Key header is required (client-generated UUID).",
         )
 
-    # Everything from here to the job insert is one critical section per user.
-    # Without it the retry short-circuit races the insert (two jobs, one
-    # charge) and the debit races itself (two jobs, one credit). The lock is
-    # per-user, so it costs nothing in the common case.
-    try:
-        with _user_ledger_lock(user):
-            return _ai_submit_locked(
-                tool_id, body, extra_payload, user, cfg, is_premium,
-                quality, variations, idempotency_key,
-            )
-    except LedgerLockError:
-        return _error_response(
-            "BUSY",
-            "Another request is still being processed. Please try again.",
-            409,
-        )
-
-
-def _ai_submit_locked(
-    tool_id, body, extra_payload, user, cfg, is_premium,
-    quality, variations, idempotency_key,
-):
-    """The charge-and-enqueue half of `_ai_submit`, under the per-user ledger
-    lock. Split out only so the lock's scope is unmistakable."""
     # True-retry short-circuit BEFORE any debit, so a replay never even attempts
     # a charge.
     existing = frappe.db.get_value(
@@ -1567,7 +1277,7 @@ def _ai_submit_locked(
 
     # Budget guard BEFORE the debit so a tripped kill switch can never strand a
     # user's credits on a job that never runs.
-    budget_err = _check_budgets(tool_id, cfg, is_premium=is_premium)
+    budget_err = _check_budgets(tool_id, cfg)
     if budget_err is not None:
         return budget_err
 
@@ -1580,20 +1290,10 @@ def _ai_submit_locked(
     # gating off, stay bounded by the per-day free quota — otherwise flipping
     # `credit_gating` on would silently uncap free floor-plan scans.
     charge_free_quota = False
-    try:
-        gating_on = _credit_gating_enabled()
-    except Exception:
-        corr = _log_unhandled("v1.ai_submit.credit_gating")
-        return _error_response(
-            "SERVER_ERROR",
-            "AI is briefly unavailable. Please try again in a moment.",
-            503,
-            correlation_id=corr,
-        )
-    if gating_on:
+    if _credit_gating_enabled():
         cost = _credit_cost_for(tool_id, quality, variations)
         if cost > 0:
-            debit_key = _idem("ai_submit", user, idempotency_key)
+            debit_key = f"ai_submit:{user}:{idempotency_key}"
             debit_result = _debit_credits(
                 user,
                 amount=cost,
@@ -1621,10 +1321,7 @@ def _ai_submit_locked(
         charge_free_quota = True
 
     if charge_free_quota:
-        # Reserve the slot now. Counting it after the enqueue let concurrent
-        # submits all pass the check before any of them incremented; the
-        # release below gives it back on every path that doesn't run a job.
-        ok, remaining = _free_quota_claim(user, tool_id, cfg.get("free_daily_limit"))
+        ok, remaining = _free_quota_check(user, tool_id, cfg.get("free_daily_limit"))
         if not ok:
             return _error_response(
                 "FREE_QUOTA_EXCEEDED",
@@ -1637,7 +1334,6 @@ def _ai_submit_locked(
     payload.update(extra_payload or {})
     payload["variations"] = variations  # persist the clamped value
 
-    job_name = None
     try:
         doc = frappe.new_doc("AI Job")
         doc.job_type = tool_id
@@ -1648,47 +1344,38 @@ def _ai_submit_locked(
         doc.request_payload_json = json.dumps(payload)
         doc.quality = quality
         doc.variation_count = variations
-        # F-42: freeze the entitlement the job was PRICED with. The worker used
-        # to re-derive premium minutes later, so a subscription lapsing while
-        # the job sat in the queue burned a watermark into an image the user
-        # had paid full Pro price for — irreversibly, with no refund path and
-        # no record that it happened.
-        doc.charged_as_premium = 1 if is_premium else 0
         doc.source_image_url = extra_payload.get("image_url") if extra_payload else None
         doc.mask_url = extra_payload.get("mask_url") if extra_payload else None
         doc.ref_image_url = extra_payload.get("ref_image_url") if extra_payload else None
         doc.insert(ignore_permissions=True)
-        job_name = doc.name
 
         # PREM-4: now that the job has a name, point the credit-debit rows at
         # it so the worker can issue a refund-by-ref if the job fails. Scoped to
         # THIS submit's debit key so we never touch another job's ledger rows.
         if debit_key:
             try:
-                m_key, t_key = _debit_sub_keys(debit_key)
                 frappe.db.sql(
                     """update `tabAI Credit Ledger`
                        set ref_name = %(name)s
                        where user = %(user)s
                          and ref_doctype = 'AI Job'
                          and (ref_name is null or ref_name = '')
-                         and idempotency_key in (%(m_key)s, %(t_key)s)""",
+                         and idempotency_key like %(key_prefix)s""",
                     {
                         "name": doc.name,
                         "user": user,
-                        "m_key": m_key,
-                        "t_key": t_key,
+                        "key_prefix": f"{debit_key}%",
                     },
                 )
             except Exception:
-                # Not fatal, but not harmless either: a refund that looks the
-                # debit up by ref_name would find nothing. `_refund_job_credits`
-                # recovers by recomputing the key, so log and carry on.
-                frappe.log_error(
-                    frappe.get_traceback(), "v1.ai_submit.ref_backfill_failed"
-                )
+                # Backfill is opportunistic — refund still works via job name
+                # if the ledger insert raced, just slower (scan by user).
+                pass
 
         frappe.db.commit()
+
+        if charge_free_quota:
+            _free_quota_increment(user)
 
         frappe.enqueue(
             "construction.api.ai_worker.run_job",
@@ -1702,45 +1389,12 @@ def _ai_submit_locked(
         corr = _log_unhandled(f"v1.ai_submit:{tool_id}")
         # Compensate the debit so a crash before the job is safely enqueued can
         # never leave the user charged for nothing.
-        #
-        # When the job row exists (the common case — it is inserted and
-        # committed before `enqueue` is even called) the compensation MUST go
-        # through the same key namespace the worker and the watchdog use.
-        # A separate reversal key deduplicated against neither, so an enqueue
-        # failure refunded once here and again an hour later from the watchdog,
-        # leaving the user a credit richer than before they submitted.
         if debit_result and debit_result.get("applied", 0) > 0:
             try:
-                if job_name:
-                    # Also mark it failed, so the watchdog isn't the thing that
-                    # discovers an orphaned `queued` row an hour from now.
-                    try:
-                        frappe.db.set_value("AI Job", job_name, {
-                            "status": "failed",
-                            "error_code": "WORKER_ERROR",
-                            "error_message": (
-                                "We couldn't start this job. "
-                                "Your credits have been refunded — please try again."
-                            ),
-                            "completed_at": frappe.utils.now_datetime(),
-                        }, update_modified=False)
-                    except Exception:
-                        frappe.log_error(
-                            frappe.get_traceback(), "v1.ai_submit.mark_failed"
-                        )
-                    _refund_job_credits(
-                        user, job_name, idempotency_key,
-                        reason="Submit failed before the job could be queued",
-                    )
-                else:
-                    _reverse_debit(user, debit_key, debit_result)
+                _reverse_debit(user, debit_key, debit_result)
                 frappe.db.commit()
             except Exception:
                 frappe.log_error(frappe.get_traceback(), "v1.ai_submit.reverse_failed")
-        # Give the free-quota slot back too. Reversing only the credit debit
-        # left free-tier users a day's quota short for a job that never ran.
-        if charge_free_quota:
-            _free_quota_release(user)
         return _error_response(
             "SERVER_ERROR", "Failed to enqueue AI job", 500, correlation_id=corr
         )
@@ -1800,10 +1454,6 @@ def ai_generate(**kwargs):
             400,
         )
 
-    pre = _submit_preflight(tool_id)
-    if pre is not None:
-        return pre
-
     # C2: text (no source photo) and sketch (hand drawing → photoreal render)
     # modes, for the three "design a space" tools only — the editing tools
     # (mask/ref/paint/…) are meaningless without a real photo.
@@ -1845,17 +1495,11 @@ def ai_generate(**kwargs):
 
     ref_url = _save_uploaded_file("ref_image")
     if isinstance(ref_url, dict) and ref_url.get("ok") is False:
-        _discard_uploads(image_url, mask_url)
         return ref_url
     if ref_url:
         extras["ref_image_url"] = ref_url
 
-    result = _ai_submit(tool_id, body, extras)
-    # Nothing sweeps an upload whose submit was rejected — the retention task
-    # only walks files reachable from an AI Job — so clean up here.
-    if isinstance(result, dict) and result.get("ok") is False:
-        _discard_uploads(image_url, mask_url, ref_url)
-    return result
+    return _ai_submit(tool_id, body, extras)
 
 
 @frappe.whitelist(methods=["POST"])
@@ -1865,10 +1509,6 @@ def ai_floor_plan_analyze(**kwargs):
     Multipart fields: image=<file>, city=<str>, quality_level=<str>
     Header: Idempotency-Key: <uuid>
     """
-    pre = _submit_preflight("floor_plan")
-    if pre is not None:
-        return pre
-
     image_url = _save_uploaded_file("image")
     if isinstance(image_url, dict) and image_url.get("ok") is False:
         return image_url
@@ -1883,10 +1523,7 @@ def ai_floor_plan_analyze(**kwargs):
                 extras[key] = val
 
     body = dict(frappe.request.form) if (frappe.request and frappe.request.form) else {}
-    result = _ai_submit("floor_plan", body, extras)
-    if isinstance(result, dict) and result.get("ok") is False:
-        _discard_uploads(image_url)
-    return result
+    return _ai_submit("floor_plan", body, extras)
 
 
 @frappe.whitelist(methods=["POST"])
@@ -1900,16 +1537,9 @@ def ai_interior_generate(**kwargs):
     return _ai_submit("interior", body, {})
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist()
 def job_status(id=None, job_id=None):
-    """Unified poll endpoint. Accepts either ?id=<> or ?job_id=<>.
-
-    A job the caller does not own is reported as NOT_FOUND, not FORBIDDEN.
-    Splitting the two answers turns this endpoint into an existence oracle:
-    with sequential job names (now `hash`, but the old rows remain) it let any
-    account measure the platform's total generation volume, and the
-    distinction buys the legitimate caller nothing.
-    """
+    """Unified poll endpoint. Accepts either ?id=<> or ?job_id=<>."""
     try:
         _require_auth()
     except frappe.AuthenticationError:
@@ -1917,8 +1547,7 @@ def job_status(id=None, job_id=None):
     name = id or job_id
     if not name:
         return _error_response("MISSING_PARAMS", "id is required")
-    owner = frappe.db.get_value("AI Job", name, "user")
-    if owner != frappe.session.user:
+    if not frappe.db.exists("AI Job", name):
         return _error_response("NOT_FOUND", "Job not found", 404)
     return _ai_status_payload(name)
 
@@ -1928,16 +1557,12 @@ ai_floor_plan_submit = ai_floor_plan_analyze
 ai_interior_submit = ai_interior_generate
 
 
-# Frappe enforces `methods=[...]` in the dispatcher, not inside the function,
-# so an alias that re-declares `@frappe.whitelist()` without the restriction
-# routes around it entirely. These two must carry the same decorator as the
-# endpoint they delegate to.
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist()
 def ai_floor_plan_status(job_id=None):
     return job_status(job_id=job_id)
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist()
 def ai_interior_status(job_id=None):
     return job_status(job_id=job_id)
 
@@ -2248,22 +1873,10 @@ def cleanup_ai_source_uploads():
     return {"jobs_scanned": len(jobs), "files_deleted": removed}
 
 
-# A RUNNING job past this is dead: `frappe.enqueue(timeout=600)` hard-kills
-# execution at 10 minutes, so past 30 the worker can no longer flip it to
-# failed and the user's credits would be stranded forever.
-_STALE_RUNNING_MINUTES = 30
-
-# A QUEUED job is a different animal. `timeout` bounds EXECUTION, not queue
-# wait, so a job can sit queued for hours behind a backlog and still be
-# perfectly alive. Failing and refunding it at 30 minutes meant the user was
-# refunded, told it failed, re-submitted at their own cost — and then the
-# original job dequeued, ran, and delivered anyway. Free vendor spend, at
-# exactly the moment vendor spend is already peaking. Give the queue a full
-# working day before declaring anything in it dead.
-_STALE_QUEUED_HOURS = 12
-
-# Kept for backwards compatibility with anything importing the old name.
-_STALE_JOB_MINUTES = _STALE_RUNNING_MINUTES
+# Jobs still queued/running this long after their last touch are dead: the
+# RQ hard-kill window is 10 minutes, so past this the worker can no longer
+# flip them to failed and the user's credits would be stranded forever.
+_STALE_JOB_MINUTES = 30
 
 
 def cleanup_stale_ai_jobs():
@@ -2274,21 +1887,16 @@ def cleanup_stale_ai_jobs():
     never runs and the ops report undercounts failures. Mark anything stale
     as failed with a user-safe message and run the standard idempotent
     refund. Deliberately does NOT feed the circuit breaker: a stale job says
-    nothing about *current* vendor health.
-
-    `running` and `queued` get different deadlines — see the constants above.
-    Conflating them refunded live work."""
+    nothing about *current* vendor health."""
     from frappe.utils import add_to_date, now_datetime
 
-    now = now_datetime()
-    running_cutoff = add_to_date(now, minutes=-_STALE_RUNNING_MINUTES)
-    queued_cutoff = add_to_date(now, hours=-_STALE_QUEUED_HOURS)
+    cutoff = add_to_date(now_datetime(), minutes=-_STALE_JOB_MINUTES)
     rows = frappe.get_all(
         "AI Job",
-        or_filters=[
-            {"status": "running", "modified": ["<", running_cutoff]},
-            {"status": "queued", "modified": ["<", queued_cutoff]},
-        ],
+        filters={
+            "status": ["in", ["queued", "running"]],
+            "modified": ["<", cutoff],
+        },
         pluck="name",
         limit_page_length=200,
     )
@@ -2307,10 +1915,10 @@ def cleanup_stale_ai_jobs():
             doc.completed_at = now_datetime()
             doc.save(ignore_permissions=True)
             if _credit_gating_enabled():
-                _refund_job_credits(
+                _refund_credits(
                     doc.user,
-                    doc.name,
-                    doc.idempotency_key,
+                    ref_doctype="AI Job",
+                    ref_name=doc.name,
                     reason="AI job stale/interrupted (watchdog)",
                 )
             failed_out += 1
@@ -2504,61 +2112,13 @@ _SUBSCRIPTION_PRODUCTS = {
 }
 
 
-def _premium_table_lock(timeout=15):
-    """`AI Settings.premium_users` is a child table on a singleton, and every
-    writer is a read-modify-write of the WHOLE table. Two activations landing
-    together therefore each save their own copy and the later save silently
-    drops the earlier one's row — a paying customer loses their entitlement
-    with nothing logged. Serialise the read-modify-write."""
-    return _user_ledger_lock("ai-settings-premium-users", timeout=timeout)
-
-
-def _premium_rows(user=None, purchase_token=None):
-    """Premium entries, optionally filtered. Read straight from the child
-    table so callers don't have to load and walk the singleton."""
-    filters = {
-        "parent": "AI Settings",
-        "parenttype": "AI Settings",
-        "parentfield": "premium_users",
-    }
-    if user:
-        filters["user"] = user
-    if purchase_token:
-        filters["purchase_token"] = purchase_token
-    return frappe.get_all(
-        "User Premium Entry",
-        filters=filters,
-        fields=[
-            "name", "user", "expires_at", "note", "platform",
-            "purchase_token", "last_verified_at", "revoked_at",
-        ],
-        limit_page_length=0,
-    )
-
-
-def _upsert_premium_row(
-    user, product_id, expires, purchase_token=None, platform="android",
-    linked_purchase_token=None,
-):
-    """Insert or update the (user, product_id) premium entry.
-
-    MUST be called under `_premium_table_lock()`.
-
-    Also records the purchase token. Without it nothing downstream can ever
-    revalidate or revoke the entitlement — a refunded annual subscription just
-    keeps working for the remaining 363 days.
-    """
-    from frappe.utils import now_datetime
-
+def _upsert_premium_row(user, product_id, expires):
+    """Insert or update the (user, product_id) premium entry."""
     settings = frappe.get_doc("AI Settings")
     found = False
     for row in (settings.get("premium_users") or []):
         if row.user == user and (row.note or "") == product_id:
             row.expires_at = expires
-            row.purchase_token = purchase_token or row.purchase_token
-            row.platform = platform or row.platform
-            row.last_verified_at = now_datetime()
-            row.revoked_at = None
             found = True
             break
     if not found:
@@ -2566,24 +2126,8 @@ def _upsert_premium_row(
             "user": user,
             "expires_at": expires,
             "note": product_id,
-            "purchase_token": purchase_token,
-            "platform": platform,
-            "last_verified_at": now_datetime(),
         })
-
-    # F-41: an upgrade/downgrade issues a NEW token and reports the one it
-    # replaced as `linkedPurchaseToken`. The old row was being left in place,
-    # so the superseded plan kept granting until its own expiry ran out.
-    if linked_purchase_token and linked_purchase_token != purchase_token:
-        settings.premium_users = [
-            row for row in (settings.get("premium_users") or [])
-            if (row.purchase_token or "") != linked_purchase_token
-        ]
-        for idx, row in enumerate(settings.premium_users, start=1):
-            row.idx = idx
-
     settings.save(ignore_permissions=True)
-    frappe.clear_document_cache("AI Settings", "AI Settings")
 
 
 @frappe.whitelist(methods=["POST"])
@@ -2627,12 +2171,10 @@ def activate_premium(**kwargs):
         )
 
     user = frappe.session.user
-    linked_token = None
 
     if play_billing.relaxed_mode():
-        # Local-QA escape hatch (play_billing_relaxed in site_config, and only
-        # on a developer_mode site — see play_billing.relaxed_mode). Grants 31
-        # days keyed on the claimed product. Never enable in production.
+        # Local-QA escape hatch (play_billing_relaxed in site_config). Grants
+        # 31 days keyed on the claimed product. Never enable in production.
         from datetime import timedelta
         frappe.log_error(
             f"activate_premium RELAXED grant for {user} ({claimed_product})",
@@ -2647,7 +2189,6 @@ def activate_premium(**kwargs):
             return _error_response(e.code, e.message, e.http_status)
         product_id = verified["product_id"] or claimed_product or "premium"
         expires = verified["expires_at"]
-        linked_token = verified.get("linked_purchase_token")
         if not verified["entitled"] or not expires or expires <= now_datetime():
             return _error_response(
                 "RECEIPT_NOT_ACTIVE",
@@ -2656,350 +2197,20 @@ def activate_premium(**kwargs):
                 details={"state": verified["state"]},
             )
 
-        # F-17: bind the receipt to the caller. Play already tells us who the
-        # purchase belongs to and the answer was being read and thrown away,
-        # so one valid token activated Pro on as many accounts as it was
-        # replayed against — each then drawing 80 credits a month.
-        claim_err = _reject_foreign_receipt(user, receipt, verified.get("obfuscated_account_id"))
-        if claim_err is not None:
-            return claim_err
-
-    try:
-        with _premium_table_lock():
-            _upsert_premium_row(
-                user, product_id, expires,
-                purchase_token=(None if play_billing.relaxed_mode() else receipt),
-                platform=(body.get("platform") or "android")[:16],
-                linked_purchase_token=linked_token,
-            )
-    except LedgerLockError:
-        return _error_response(
-            "BUSY", "Please try again in a moment.", 409,
-        )
-
-    # Seed this billing period's Pro credits so the subscriber isn't stuck on
-    # leftover welcome credits until the nightly scheduler runs. Idempotent per
+    _upsert_premium_row(user, product_id, expires)
+    # Seed this month's Pro credits so the subscriber isn't stuck on leftover
+    # welcome credits until the nightly scheduler runs. Idempotent per
     # (user, period), so activate + scheduler can never double-grant.
-    #
-    # F-24: this used to be best-effort — a failure here left the customer
-    # entitled but with zero credits, i.e. paid and immediately 402'd. The
-    # grant is retried once and its outcome is reported, and the daily task is
-    # the backstop if both attempts fail.
-    credits_granted = False
-    for attempt in (1, 2):
-        try:
-            _grant_monthly_credits(user, reason=f"Pro activation: {product_id}")
-            credits_granted = True
-            break
-        except Exception:
-            frappe.log_error(
-                frappe.get_traceback(), f"activate_premium.monthly_grant.{attempt}"
-            )
+    try:
+        _grant_monthly_credits(user, reason=f"Pro activation: {product_id}")
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "activate_premium.monthly_grant")
     frappe.db.commit()
-    state = _get_credit_state(user)
     return {
         "premium": True,
         "expires_at": str(expires),
         "source": product_id,
-        "credits_granted": credits_granted,
-        "balance": state["total_balance"],
     }
-
-
-def _account_binding_id(user):
-    """The value the client should send Play as `obfuscatedAccountId`.
-
-    A hash, not the account id itself: Play stores it, shows it in the
-    Console, and it must not be reusable as a credential or leak an email.
-    """
-    return hashlib.sha256(f"acct:{user}".encode("utf-8")).hexdigest()[:64]
-
-
-def _reject_foreign_receipt(user, purchase_token, obfuscated_account_id):
-    """Refuse a purchase token that already belongs to a different account.
-
-    Two independent checks, because they cover different eras:
-
-    * `obfuscatedExternalAccountId` — set by the client at purchase time and
-      returned by Play. When it is present and in our own format it is
-      authoritative. Purchases made before the app started sending it (or by a
-      client that omits it) simply don't have one.
-    * token exclusivity — whoever claims a token first owns it. This holds for
-      legacy purchases with no account id, and is the check that actually
-      stops a token being replayed across accounts.
-
-    Returns an error response, or None when the claim is legitimate.
-    """
-    expected = _account_binding_id(user)
-    if obfuscated_account_id:
-        oid = str(obfuscated_account_id).strip()
-        # Only enforce against ids in OUR format; a legacy client sent its
-        # device id here, and rejecting those would strand real subscribers.
-        if len(oid) == 64 and all(c in "0123456789abcdef" for c in oid.lower()):
-            if oid.lower() != expected:
-                frappe.log_error(
-                    f"activate_premium: receipt bound to another account "
-                    f"(caller={user})",
-                    "v1.activate_premium.foreign_receipt",
-                )
-                return _error_response(
-                    "RECEIPT_FOREIGN",
-                    "This purchase belongs to a different account.",
-                    403,
-                )
-            return None
-
-    for row in _premium_rows(purchase_token=purchase_token):
-        if row.user != user:
-            frappe.log_error(
-                f"activate_premium: token already claimed by {row.user}, "
-                f"replayed by {user}",
-                "v1.activate_premium.foreign_receipt",
-            )
-            return _error_response(
-                "RECEIPT_FOREIGN",
-                "This purchase belongs to a different account.",
-                403,
-            )
-    return None
-
-
-def _clawback_credits(user, purchase_token, reason):
-    """Write the `clawback_refund` event the ledger schema has always defined
-    and nothing has ever written.
-
-    Removes the granted credits the revoked purchase paid for, down to zero —
-    we claw back what is left, not what was spent, because a negative balance
-    from a refund would lock a user out of the free tier too.
-    """
-    state = _get_credit_state(user)
-    take = min(
-        max(0, state["monthly_balance"]) + max(0, state["topup_balance"]),
-        _DEFAULT_MONTHLY_QUOTA,
-    )
-    if take <= 0:
-        return 0
-    monthly_take = min(max(0, state["monthly_balance"]), take)
-    topup_take = take - monthly_take
-    base = _idem("clawback", user, purchase_token)
-    if monthly_take > 0:
-        _insert_ledger_event(
-            user,
-            event_type="clawback_refund",
-            bucket="monthly",
-            delta=-monthly_take,
-            reason=reason[:200],
-            idempotency_key=f"{base}:m",
-            period_month=_current_period_month(user),
-        )
-    if topup_take > 0:
-        _insert_ledger_event(
-            user,
-            event_type="clawback_refund",
-            bucket="topup",
-            delta=-topup_take,
-            reason=reason[:200],
-            idempotency_key=f"{base}:t",
-        )
-    return take
-
-
-def _revoke_premium_row(row_name, user, purchase_token, reason):
-    """Mark one entitlement revoked and claw back its credits. Idempotent."""
-    from frappe.utils import now_datetime
-
-    frappe.db.set_value(
-        "User Premium Entry",
-        row_name,
-        {"expires_at": now_datetime(), "revoked_at": now_datetime()},
-        update_modified=False,
-    )
-    frappe.clear_document_cache("AI Settings", "AI Settings")
-    try:
-        _clawback_credits(user, purchase_token, reason)
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "v1.revoke_premium.clawback")
-    frappe.log_error(
-        f"Premium revoked for {user}: {reason}", "v1.premium_revoked"
-    )
-
-
-def revalidate_premium_subscriptions(limit=200):
-    """Daily scheduler task: re-check live entitlements against Play.
-
-    Money moved out of this system and never back: there was no RTDN handler,
-    no Voided Purchases polling, no revalidation, and the `clawback_refund`
-    event the schema defines had zero writers. A refunded annual subscription
-    kept Pro for the remaining ~363 days and collected twelve further monthly
-    credit grants.
-
-    This is the polling half (the push half is `play_rtdn`). It is deliberately
-    the backstop rather than the primary: RTDN can be missed, misconfigured, or
-    silently unsubscribed, and a daily sweep notices anyway.
-    """
-    from construction.api import play_billing
-    from frappe.utils import now_datetime
-
-    if not play_billing.is_configured():
-        return {"checked": 0, "revoked": 0, "skipped": "play_billing_unconfigured"}
-
-    now = now_datetime()
-    checked = 0
-    revoked = 0
-    for row in _premium_rows()[: int(limit)]:
-        if row.revoked_at or not row.purchase_token:
-            continue
-        if row.expires_at and row.expires_at <= now:
-            continue  # already lapsed; nothing to revoke
-        checked += 1
-        try:
-            verified = play_billing.verify_subscription(row.purchase_token)
-        except play_billing.PlayBillingError as e:
-            if e.code == "INVALID_RECEIPT":
-                _revoke_premium_row(
-                    row.name, row.user, row.purchase_token,
-                    "Play no longer recognises this purchase token",
-                )
-                revoked += 1
-            # PLAY_API_ERROR is transient — leave the entitlement alone and
-            # let tomorrow's run decide.
-            continue
-        except Exception:
-            frappe.log_error(frappe.get_traceback(), "v1.revalidate_premium")
-            continue
-
-        entitled = verified.get("entitled") and verified.get("expires_at")
-        if not entitled:
-            _revoke_premium_row(
-                row.name, row.user, row.purchase_token,
-                f"Play reports state={verified.get('state')}",
-            )
-            revoked += 1
-            continue
-
-        # Still good — carry Play's expiry forward so a renewal lands without
-        # the user having to relaunch the app, and stamp the check.
-        frappe.db.set_value(
-            "User Premium Entry",
-            row.name,
-            {"expires_at": verified["expires_at"], "last_verified_at": now},
-            update_modified=False,
-        )
-    frappe.clear_document_cache("AI Settings", "AI Settings")
-    frappe.db.commit()
-    return {"checked": checked, "revoked": revoked}
-
-
-# Play RTDN states that end entitlement immediately. 12 = REVOKED,
-# 13 = EXPIRED, 3 = PURCHASED-then-refunded is delivered as SUBSCRIPTION_REVOKED.
-_RTDN_TERMINAL = {12, 13}
-
-
-@frappe.whitelist(allow_guest=True, methods=["POST"])
-def play_rtdn(**kwargs):
-    """Google Play Real-Time Developer Notifications push endpoint.
-
-    Subscribe this URL as a Pub/Sub *push* endpoint with authentication
-    enabled, and set `play_rtdn_audience` (the push config's audience) plus
-    `play_rtdn_service_account` (the service account Pub/Sub signs as) in
-    site_config. The OIDC token in the Authorization header is verified before
-    a single byte of the body is trusted — an unauthenticated endpoint that
-    revokes entitlements is its own denial-of-service.
-
-    We do not trust the notification's contents to decide anything: it only
-    tells us WHICH token to re-check. The decision always comes from a fresh
-    `verify_subscription` call.
-    """
-    auth_err = _verify_rtdn_token()
-    if auth_err is not None:
-        return auth_err
-
-    import base64
-
-    body = _read_json_body() or {}
-    msg = (body.get("message") or {}) if isinstance(body, dict) else {}
-    raw = msg.get("data")
-    if not raw:
-        return {"ok": True, "ignored": "no data"}
-    try:
-        payload = json.loads(base64.b64decode(raw).decode("utf-8"))
-    except Exception:
-        return {"ok": True, "ignored": "undecodable"}
-
-    sub = payload.get("subscriptionNotification") or {}
-    voided = payload.get("voidedPurchaseNotification") or {}
-    token = sub.get("purchaseToken") or voided.get("purchaseToken")
-    if not token:
-        return {"ok": True, "ignored": "no token"}
-
-    from construction.api import play_billing
-    from frappe.utils import now_datetime
-
-    rows = _premium_rows(purchase_token=token)
-    if not rows:
-        return {"ok": True, "ignored": "unknown token"}
-
-    handled = 0
-    for row in rows:
-        if row.revoked_at:
-            continue
-        if voided:
-            _revoke_premium_row(row.name, row.user, token, "Play voided this purchase")
-            handled += 1
-            continue
-        try:
-            verified = play_billing.verify_subscription(token)
-        except Exception:
-            # Can't confirm right now; the daily sweep will.
-            continue
-        if verified.get("entitled") and verified.get("expires_at"):
-            frappe.db.set_value(
-                "User Premium Entry",
-                row.name,
-                {"expires_at": verified["expires_at"], "last_verified_at": now_datetime()},
-                update_modified=False,
-            )
-        else:
-            _revoke_premium_row(
-                row.name, row.user, token,
-                f"RTDN + Play state={verified.get('state')}",
-            )
-        handled += 1
-    frappe.clear_document_cache("AI Settings", "AI Settings")
-    frappe.db.commit()
-    return {"ok": True, "handled": handled}
-
-
-def _verify_rtdn_token():
-    """Verify the Pub/Sub push OIDC token. Returns an error response or None."""
-    conf = frappe.get_site_config()
-    audience = conf.get("play_rtdn_audience")
-    expected_sa = conf.get("play_rtdn_service_account")
-    if not audience or not expected_sa:
-        # Unconfigured means unsubscribed. Refuse rather than accept anonymous
-        # revocation requests.
-        return _error_response(
-            "RTDN_UNCONFIGURED", "This endpoint is not configured.", 503
-        )
-    header = ""
-    if frappe.request and frappe.request.headers:
-        header = frappe.request.headers.get("Authorization") or ""
-    if not header.lower().startswith("bearer "):
-        return _error_response("UNAUTHORIZED", "Missing bearer token", 401)
-    token = header.split(" ", 1)[1].strip()
-    try:
-        from google.auth.transport import requests as ga_requests
-        from google.oauth2 import id_token
-
-        claims = id_token.verify_oauth2_token(
-            token, ga_requests.Request(), audience
-        )
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "v1.play_rtdn.bad_token")
-        return _error_response("UNAUTHORIZED", "Invalid token", 401)
-    if claims.get("email") != expected_sa or not claims.get("email_verified"):
-        return _error_response("UNAUTHORIZED", "Unexpected caller", 403)
-    return None
 
 
 def grant_monthly_credits_for_active_pros():
@@ -3017,8 +2228,6 @@ def grant_monthly_credits_for_active_pros():
         if row.user in seen:
             continue
         if (row.note or "") == "trial":
-            continue
-        if getattr(row, "revoked_at", None):
             continue
         if row.expires_at and row.expires_at <= now:
             continue
@@ -3046,28 +2255,11 @@ def log_client_error(**kwargs):
       network_status, environment, breadcrumbs, context_json.
 
     Returns {ok, correlation_id} so the client can surface the id.
-
-    Unauthenticated by necessity — a crash report is most valuable exactly when
-    auth is what broke — so it is bounded instead: a per-IP daily cap, and hard
-    length limits on every field. Without those it is an open, unbounded write
-    into the table the team reads to triage real incidents, which makes both
-    flooding it and hiding a real crash in the noise trivial.
     """
     try:
-        if not _ip_daily_allowed("client_err_ip", _CLIENT_ERROR_IP_DAILY_CAP):
-            # Deliberately a success shape: a client that can't report an error
-            # should not then error about failing to report it.
-            return {"ok": True, "correlation_id": None, "throttled": True}
-
-        data = _read_json_body()
+        data = _read_json_body() if not kwargs else kwargs
         if not isinstance(data, dict):
             data = {}
-
-        def _cap(key, limit):
-            val = data.get(key)
-            if val is None:
-                return None
-            return str(val)[:limit]
 
         correlation_id = (str(data.get("correlation_id") or "")[:64]
                           or uuid.uuid4().hex[:12])
@@ -3078,34 +2270,29 @@ def log_client_error(**kwargs):
         source = data.get("source") or "app"
         AppErrorLog.record(
             source=source if source in ("app", "api") else "app",
-            level=_cap("level", 20),
+            level=data.get("level"),
             is_fatal=bool(data.get("is_fatal")),
-            title=_cap("title", 140),
-            message=(_cap("message", 2000) or _cap("stack", 2000)
-                     or "Unknown client error"),
-            error_type=_cap("error_type", 140),
+            title=data.get("title"),
+            message=data.get("message") or data.get("stack") or "Unknown client error",
+            error_type=data.get("error_type"),
             # Accept both `stack` (legacy) and `stack_trace`.
-            stack_trace=(_cap("stack_trace", 8000) or _cap("stack", 8000)),
-            endpoint=_cap("endpoint", 255),
-            http_method=_cap("http_method", 10),
+            stack_trace=data.get("stack_trace") or data.get("stack"),
+            endpoint=data.get("endpoint"),
+            http_method=data.get("http_method"),
             http_status=data.get("http_status"),
-            request_id=_cap("request_id", 64),
-            route=_cap("route", 255),
+            request_id=data.get("request_id"),
+            route=data.get("route"),
             correlation_id=correlation_id,
-            network_status=_cap("network_status", 40),
-            breadcrumbs=_cap("breadcrumbs", 4000),
-            context_json=_cap("context_json", 8000),
-            device_model=_cap("device_model", 140),
-            os_version=_cap("os_version", 60),
-            # F-29: the raw device id is no longer accepted here. It used to be
-            # written verbatim into a table anyone can read a copy of, while
-            # simultaneously being the thing that unlocked an account.
-            device_id=(hashlib.sha256(str(data.get("device_id")).encode("utf-8")).hexdigest()[:32]
-                       if data.get("device_id") else None),
-            app_version=_cap("app_version", 40),
-            build_number=_cap("build_number", 40),
-            platform=_cap("platform", 20),
-            environment=_cap("environment", 20),
+            network_status=data.get("network_status"),
+            breadcrumbs=data.get("breadcrumbs"),
+            context_json=data.get("context_json"),
+            device_model=data.get("device_model"),
+            os_version=data.get("os_version"),
+            device_id=data.get("device_id"),
+            app_version=data.get("app_version"),
+            build_number=data.get("build_number"),
+            platform=data.get("platform"),
+            environment=data.get("environment"),
             user=(frappe.session.user if frappe.session.user != "Guest" else None),
         )
         frappe.db.commit()
@@ -3151,10 +2338,6 @@ def sync_expenses(**kwargs):
         _require_auth()
     except frappe.AuthenticationError:
         return _error_response("UNAUTHORIZED", "Authentication required", 401)
-
-    gate = _require_sync_entitlement()
-    if gate is not None:
-        return gate
 
     data = _read_json_body()
     if data is None:
@@ -3372,177 +2555,18 @@ _DEFAULT_MONTHLY_QUOTA = 80
 # Play Integrity, enforced higher up; this just sets the amount).
 _DEFAULT_WELCOME_QUOTA = 5
 
-# `AI Credit Ledger.idempotency_key` is Data(80) with a unique index.
-_LEDGER_KEY_MAX = 80
 
-
-def _idem(*parts):
-    """Build a fixed-width, wildcard-free ledger idempotency key.
-
-    Every key in this ledger is derived from client-supplied text — the
-    `Idempotency-Key` header, a device id, a user's email. Interpolating that
-    text into a key raw had two consequences, and both were exploitable:
-
-    * the value reached a SQL ``LIKE`` pattern, so a key of ``%`` matched every
-      prior debit row and the server concluded the run was already paid for;
-    * long values overflowed the 80-char column, so a compensating reversal
-      inserted as a *fresh* credit instead of deduplicating against itself.
-
-    Hashing closes both at once. The first part stays in the clear as a
-    readable namespace, so the ledger is still greppable by event kind;
-    everything after it is folded into a digest. The result is at most 65
-    chars and contains only ``[a-z0-9_:]`` — no SQL metacharacters, no
-    overflow, and still deterministic for the same inputs.
-    """
-    prefix = re.sub(r"[^a-z0-9_]", "", str(parts[0] or "key").lower())[:24] or "key"
-    joined = "\x1f".join("" if p is None else str(p) for p in parts)
-    return f"{prefix}:{hashlib.sha256(joined.encode('utf-8')).hexdigest()[:40]}"
-
-
-def _debit_sub_keys(base_key):
-    """The two per-bucket keys one debit can produce. Short suffixes on
-    purpose: `_idem` already spends 65 of the column's 80 chars."""
-    if not base_key:
-        return None, None
-    return f"{base_key}:m", f"{base_key}:t"
-
-
-class LedgerLockError(Exception):
-    """Raised when the per-user credit lock could not be acquired."""
-
-
-@contextmanager
-def _user_ledger_lock(user, timeout=10):
-    """Serialise every credit mutation for one user, across processes.
-
-    The spend decision is read-balance -> decide -> insert, which is not
-    atomic: two concurrent submits both read the same balance, both conclude
-    there is room, and both insert. One generation is then free. A MariaDB
-    advisory lock keyed on the user makes that whole sequence mutually
-    exclusive across web workers and background jobs.
-
-    Fails CLOSED — if the lock can't be taken we raise rather than fall
-    through to the unserialised path, because falling through is exactly the
-    race being closed. The lock is connection-scoped, so it survives the
-    commits taken inside the block, and it is always released in `finally`.
-    """
-    key = "credits:" + hashlib.sha256((user or "").encode("utf-8")).hexdigest()[:48]
-    try:
-        got = frappe.db.sql("select get_lock(%s, %s)", (key, int(timeout)))
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "v1.ledger_lock_acquire")
-        raise LedgerLockError("Could not acquire the credit lock")
-    if not got or not got[0] or not got[0][0]:
-        raise LedgerLockError("Timed out acquiring the credit lock")
-    try:
-        yield
-    finally:
-        try:
-            frappe.db.sql("select release_lock(%s)", (key,))
-        except Exception:
-            frappe.log_error(frappe.get_traceback(), "v1.ledger_lock_release")
-
-
-def _calendar_period():
-    """The current calendar month as 'YYYY-MM'. The period free users are on."""
-    return frappe.utils.now_datetime().strftime("%Y-%m")
-
-
-def _shift_month(d, months):
-    """`d` moved by `months`, clamped to the last valid day of the target
-    month (so an anchor of the 31st lands on the 30th / 28th where needed)."""
-    import calendar
-    from datetime import date
-
-    total = (d.year * 12 + (d.month - 1)) + months
-    year, month = divmod(total, 12)
-    month += 1
-    return date(year, month, min(d.day, calendar.monthrange(year, month)[1]))
-
-
-def _billing_period_start(anchor_day, today=None):
-    """Start date of the billing period containing `today`, for a subscription
-    whose renewal falls on `anchor_day` of the month."""
-    import calendar
-    from datetime import date
-
-    today = today or frappe.utils.getdate(frappe.utils.now_datetime())
-    day = min(int(anchor_day), calendar.monthrange(today.year, today.month)[1])
-    start = date(today.year, today.month, day)
-    if start > today:
-        start = _shift_month(date(today.year, today.month, int(anchor_day)), -1)
-    return start
-
-
-def _subscription_anchor_day(user):
-    """Day-of-month a Pro subscriber's credit period turns over, or None for
-    free users. Taken from the entitlement's `expires_at`, which Play derives
-    from the actual purchase date."""
-    try:
-        rows = frappe.get_all(
-            "User Premium Entry",
-            filters={
-                "parent": "AI Settings",
-                "parenttype": "AI Settings",
-                "parentfield": "premium_users",
-                "user": user,
-            },
-            fields=["expires_at", "revoked_at"],
-            limit_page_length=0,
-        )
-    except Exception:
-        return None
+def _current_period_month():
+    """Return the current billing month as 'YYYY-MM'."""
     now = frappe.utils.now_datetime()
-    best = None
-    for r in rows:
-        if r.get("revoked_at"):
-            continue
-        exp = r.get("expires_at")
-        if not exp:
-            continue
-        if exp <= now:
-            continue
-        if best is None or exp > best:
-            best = exp
-    if best is None:
-        return None
-    return frappe.utils.getdate(best).day
+    return now.strftime("%Y-%m")
 
 
-def _current_period_month(user=None):
-    """The credit period `user` is currently in.
-
-    Free users are on calendar months ('YYYY-MM'). Pro subscribers are on
-    their OWN billing cycle, labelled by the period's start date
-    ('YYYY-MM-DD').
-
-    Granting per calendar month gave 13 grants per 12 payments: subscribe on
-    the 31st and this month's 80 credits land immediately, next month's the
-    following day. Anchoring the period on the subscription's renewal day
-    makes one paid period yield exactly one grant.
-
-    Called with no user for the handful of places that only need a coarse
-    label (reversal tagging, ops reporting).
-    """
-    if not user or user == "Guest":
-        return _calendar_period()
-    anchor = _subscription_anchor_day(user)
-    if not anchor:
-        return _calendar_period()
-    return _billing_period_start(anchor).strftime("%Y-%m-%d")
-
-
-def _next_period_start(period_month=None, user=None):
-    """First instant of the period after `period_month`. Used for
-    `next_reset_at` in the API response."""
-    period = period_month or _current_period_month(user)
-    parts = [int(x) for x in period.split("-")]
-    if len(parts) == 3:
-        from datetime import date
-
-        nxt = _shift_month(date(parts[0], parts[1], parts[2]), 1)
-        return frappe.utils.get_datetime(f"{nxt} 00:00:00")
-    year, month = parts
+def _next_period_start(period_month=None):
+    """First instant of the month after `period_month` (or after the current
+    period when not specified). Used for `next_reset_at` in the API response."""
+    period = period_month or _current_period_month()
+    year, month = (int(x) for x in period.split("-"))
     if month == 12:
         return frappe.utils.get_datetime(f"{year + 1}-01-01 00:00:00")
     return frappe.utils.get_datetime(f"{year}-{month + 1:02d}-01 00:00:00")
@@ -3567,17 +2591,10 @@ def _sum_deltas(user, bucket, period_month=None):
 
 
 def _get_credit_state(user, monthly_quota=_DEFAULT_MONTHLY_QUOTA):
-    """Computed credit state for `user`. Read-only; never mutates.
-
-    Balances are deliberately NOT clamped at zero. Clamping hid overspend: a
-    bucket that had gone negative read back as 0, so credits the user had
-    already consumed were silently written off and the next debit started from
-    a wrong baseline. A negative balance here is real — the spend gate
-    compares against it and ops can see it in the ledger.
-    """
-    period = _current_period_month(user)
-    monthly_balance = _sum_deltas(user, "monthly", period_month=period)
-    topup_balance = _sum_deltas(user, "topup")
+    """Computed credit state for `user`. Read-only; never mutates."""
+    period = _current_period_month()
+    monthly_balance = max(0, _sum_deltas(user, "monthly", period_month=period))
+    topup_balance = max(0, _sum_deltas(user, "topup"))
     monthly_used = max(0, monthly_quota - monthly_balance)
     return {
         "monthly_balance": monthly_balance,
@@ -3586,7 +2603,7 @@ def _get_credit_state(user, monthly_quota=_DEFAULT_MONTHLY_QUOTA):
         "topup_balance": topup_balance,
         "total_balance": monthly_balance + topup_balance,
         "period_month": period,
-        "next_reset_at": str(_next_period_start(period, user=user)),
+        "next_reset_at": str(_next_period_start(period)),
     }
 
 
@@ -3600,40 +2617,29 @@ def _insert_ledger_event(
     ref_name=None,
     idempotency_key=None,
     period_month=None,
-    legacy_keys=None,
 ):
-    """Insert a single ledger row, returning the true balance afterwards.
+    """Insert a single ledger row, returning the snapshot balance afterwards.
 
-    When `idempotency_key` is set and a row already exists with that key — or
-    with any of `legacy_keys`, the pre-hash key formats rows may still carry
-    from before `_idem` — this is a no-op and returns the existing row's
-    `balance_after`. Callers rely on that for webhook and IAP retries.
-
-    The pre-check races, so the column's unique index is treated as the real
-    arbiter: a duplicate-key error on insert is the same no-op, not a 500.
+    When `idempotency_key` is set and a row already exists with that key, this
+    is a no-op (returns the existing row's balance_after). Callers can rely on
+    this for webhook retries.
     """
-    lookup = [k for k in ([idempotency_key] + list(legacy_keys or [])) if k]
-    if lookup:
+    if idempotency_key:
         existing = frappe.db.get_value(
             "AI Credit Ledger",
-            {"idempotency_key": ["in", lookup]},
+            {"idempotency_key": idempotency_key},
             ["balance_after"],
             as_dict=True,
         )
         if existing:
             return int(existing.get("balance_after") or 0)
 
-    if idempotency_key and len(idempotency_key) > _LEDGER_KEY_MAX:
-        # Never silently truncate. A truncated key collides with every other
-        # key sharing its prefix, which is how a compensating reversal once
-        # inserted itself as a brand-new credit.
-        raise ValueError(
-            f"idempotency_key exceeds {_LEDGER_KEY_MAX} chars: {idempotency_key[:32]}..."
-        )
-
-    # Snapshot the balance *after* this event. Unclamped, matching
-    # `_get_credit_state` — this column is an audit trail, not a display value.
-    snapshot_total = _get_credit_state(user)["total_balance"] + int(delta)
+    # Compute new total balance for the snapshot. Must include this delta.
+    snapshot = _get_credit_state(user)
+    if bucket == "monthly":
+        snapshot_total = max(0, snapshot["monthly_balance"] + delta) + snapshot["topup_balance"]
+    else:
+        snapshot_total = snapshot["monthly_balance"] + max(0, snapshot["topup_balance"] + delta)
 
     doc = frappe.new_doc("AI Credit Ledger")
     doc.user = user
@@ -3646,20 +2652,7 @@ def _insert_ledger_event(
     doc.ref_name = (ref_name or "")[:200]
     doc.idempotency_key = idempotency_key or ""
     doc.period_month = period_month or ""
-    try:
-        doc.insert(ignore_permissions=True)
-    except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
-        # Lost the race against a concurrent identical event. That is the
-        # dedup working, so report the winner's balance instead of failing.
-        if not idempotency_key:
-            raise
-        existing = frappe.db.get_value(
-            "AI Credit Ledger",
-            {"idempotency_key": idempotency_key},
-            ["balance_after"],
-            as_dict=True,
-        )
-        return int((existing or {}).get("balance_after") or 0)
+    doc.insert(ignore_permissions=True)
     return snapshot_total
 
 
@@ -3670,35 +2663,30 @@ def _grant_monthly_credits(user, period_month=None, quota=_DEFAULT_MONTHLY_QUOTA
     grant for the target period. Re-running this for the same period is a
     no-op thanks to the idempotency key.
     """
-    period = period_month or _current_period_month(user)
-    legacy = f"grant_monthly:{user}:{period}"
+    period = period_month or _current_period_month()
+    idem = f"grant_monthly:{user}:{period}"
     return _insert_ledger_event(
         user,
         event_type="grant_monthly",
         bucket="monthly",
         delta=int(quota),
         reason=reason or f"Monthly Pro grant for {period}",
-        idempotency_key=_idem("grant_monthly", user, period),
+        idempotency_key=idem,
         period_month=period,
-        legacy_keys=[legacy, legacy[:_LEDGER_KEY_MAX]],
     )
 
 
-def _grant_welcome_credits(user, amount=_DEFAULT_WELCOME_QUOTA, device_id=None, reason=None):
-    """Idempotent per device — one welcome grant per device identity, ever.
-
-    Keyed on the device id rather than the user so that deleting and
-    re-bootstrapping an account cannot re-claim the grant.
+def _grant_welcome_credits(user, amount=_DEFAULT_WELCOME_QUOTA, idempotency_key=None, reason=None):
+    """Idempotent on `idempotency_key` — caller should pass a hashed device id
+    + 'welcome' so each device only ever gets the grant once.
     """
-    legacy = f"welcome:{device_id}"
     return _insert_ledger_event(
         user,
         event_type="grant_welcome",
         bucket="topup",
         delta=int(amount),
         reason=reason or "Welcome design credits",
-        idempotency_key=_idem("welcome", device_id),
-        legacy_keys=[legacy, legacy[:_LEDGER_KEY_MAX]],
+        idempotency_key=idempotency_key,
     )
 
 
@@ -3711,41 +2699,32 @@ def _grant_welcome_credits(user, amount=_DEFAULT_WELCOME_QUOTA, device_id=None, 
 # would deny real users their welcome credits. Fail-open everywhere.
 _WELCOME_IP_DAILY_CAP = 50
 
-# Ceiling on brand-new anonymous ACCOUNTS from one IP per day. Creation is
-# unauthenticated by design (no-login product), so without this a script can
-# mint accounts without limit and reset every per-user rate limit, free-quota
-# counter and welcome grant simply by asking for a new identity. Deliberately
-# looser than the welcome cap: carrier-grade NAT puts a lot of genuine first
-# launches behind one address.
-_BOOTSTRAP_IP_DAILY_CAP = 120
 
-# Ceiling on client crash reports from one IP per day. Generous — a device in
-# a crash loop legitimately produces a burst — but finite.
-_CLIENT_ERROR_IP_DAILY_CAP = 500
-
-
-def _ip_daily_allowed(prefix, cap, ip=None):
-    """Atomically claim one slot of a per-IP daily budget.
-
-    Fails CLOSED. The previous version returned True on any error, which meant
-    the one control standing between a script and unlimited free credits could
-    be switched off by making the cache unavailable — and a get-then-set
-    counter let concurrent callers walk straight through it regardless.
-    """
-    ip = ip or _client_ip()
-    if not ip:
-        return False
-    from frappe.utils import nowdate
-
-    n = _counter_incr(f"{prefix}:{ip}:{nowdate()}", 60 * 60 * 36)
-    if n is None:
-        return False
-    return n <= cap
-
-
-def _welcome_ip_allowed(ip=None):
-    """True if this client IP hasn't exceeded the daily new-welcome-grant cap."""
-    return _ip_daily_allowed("welcome_ip2", _WELCOME_IP_DAILY_CAP, ip=ip)
+def _welcome_ip_allowed():
+    """True if this client IP hasn't exceeded the daily new-welcome-grant cap.
+    Fail-open: any cache/lookup error returns True so we never block a real
+    user's onboarding over a counter."""
+    try:
+        ip = getattr(frappe.local, "request_ip", None)
+        if not ip and frappe.request:
+            fwd = frappe.request.headers.get("X-Forwarded-For", "")
+            ip = fwd.split(",")[0].strip() if fwd else None
+        if not ip:
+            return True
+        from frappe.utils import nowdate
+        key = f"welcome_ip:{ip}:{nowdate()}"
+        cache = frappe.cache()
+        n = cache.get_value(key) or 0
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= _WELCOME_IP_DAILY_CAP:
+            return False
+        cache.set_value(key, n + 1, expires_in_sec=60 * 60 * 36)
+        return True
+    except Exception:
+        return True
 
 
 def _grant_topup_credits(user, amount, idempotency_key, reason=None, ref_name=None):
@@ -3775,24 +2754,16 @@ def _debit_credits(user, amount, ref_doctype, ref_name, reason=None, idempotency
 
     Idempotency: when `idempotency_key` is set, a re-debit with the same key
     is a no-op (returns the same applied count derived from existing rows).
-
-    CALLERS MUST HOLD `_user_ledger_lock(user)`. Everything below is a
-    read-decide-insert sequence and is only atomic under that lock.
     """
     amount = int(amount)
     if amount <= 0:
         return {"applied": 0, "monthly_taken": 0, "topup_taken": 0, "balance_after": 0}
 
-    monthly_key, topup_key = _debit_sub_keys(idempotency_key)
-
-    # Idempotency check: look up the exact rows this key can have produced.
-    # This used to be a `LIKE '<key>%'` pattern built from the raw client
-    # header — a key of "%" matched every prior debit in the table and the
-    # server concluded the run was already paid for. Exact match, always.
+    # Idempotency check: look up any prior debit with this key.
     if idempotency_key:
         prior = frappe.get_all(
             "AI Credit Ledger",
-            filters={"idempotency_key": ["in", [monthly_key, topup_key]]},
+            filters={"idempotency_key": ["like", f"{idempotency_key}%"]},
             fields=["delta", "bucket", "balance_after"],
         )
         if prior:
@@ -3822,7 +2793,7 @@ def _debit_credits(user, amount, ref_doctype, ref_name, reason=None, idempotency
             reason=reason or "AI submission",
             ref_doctype=ref_doctype,
             ref_name=ref_name,
-            idempotency_key=monthly_key,
+            idempotency_key=(f"{idempotency_key}:monthly" if idempotency_key else None),
             period_month=state["period_month"],
         )
     if topup_take > 0:
@@ -3834,7 +2805,7 @@ def _debit_credits(user, amount, ref_doctype, ref_name, reason=None, idempotency
             reason=reason or "AI submission",
             ref_doctype=ref_doctype,
             ref_name=ref_name,
-            idempotency_key=topup_key,
+            idempotency_key=(f"{idempotency_key}:topup" if idempotency_key else None),
         )
 
     return {
@@ -3860,52 +2831,28 @@ def _refund_credits(user, ref_doctype, ref_name, reason=None):
             "ref_name": ref_name,
             "event_type": "debit_submit",
         },
-        fields=["delta", "bucket", "period_month"],
+        fields=["delta", "bucket"],
     )
     if not debits:
         return {"applied": 0, "balance_after": _get_credit_state(user)["total_balance"]}
 
-    monthly_rows = [r for r in debits if r.bucket == "monthly" and int(r.delta) < 0]
-    monthly_amt = -sum(int(r.delta) for r in monthly_rows)
+    monthly_amt = -sum(int(r.delta) for r in debits if r.bucket == "monthly" and int(r.delta) < 0)
     topup_amt = -sum(int(r.delta) for r in debits if r.bucket == "topup" and int(r.delta) < 0)
-    base_key = _idem("refund", ref_doctype, ref_name)
-    legacy_base = f"refund:{ref_doctype}:{ref_name}"
-    monthly_key, topup_key = _debit_sub_keys(base_key)
-    debit_period = next((r.period_month for r in monthly_rows if r.period_month), None)
-    current_period = _current_period_month(user)
+    base_key = f"refund:{ref_doctype}:{ref_name}"
     balance_after = 0
 
     if monthly_amt > 0:
-        if debit_period and debit_period != current_period:
-            # The period those credits came from has already reset, so putting
-            # them back there refunds into a dead bucket the user can never
-            # spend. Land them in `topup` instead: the user genuinely gets the
-            # credit back, and this month's quota is not inflated (which is
-            # what tagging the refund with the *current* period used to do).
-            balance_after = _insert_ledger_event(
-                user,
-                event_type="refund_failure",
-                bucket="topup",
-                delta=monthly_amt,
-                reason=reason or "Refund on job failure (expired period)",
-                ref_doctype=ref_doctype,
-                ref_name=ref_name,
-                idempotency_key=monthly_key,
-                legacy_keys=[f"{legacy_base}:monthly"],
-            )
-        else:
-            balance_after = _insert_ledger_event(
-                user,
-                event_type="refund_failure",
-                bucket="monthly",
-                delta=monthly_amt,
-                reason=reason or "Refund on job failure",
-                ref_doctype=ref_doctype,
-                ref_name=ref_name,
-                idempotency_key=monthly_key,
-                period_month=debit_period or current_period,
-                legacy_keys=[f"{legacy_base}:monthly"],
-            )
+        balance_after = _insert_ledger_event(
+            user,
+            event_type="refund_failure",
+            bucket="monthly",
+            delta=monthly_amt,
+            reason=reason or "Refund on job failure",
+            ref_doctype=ref_doctype,
+            ref_name=ref_name,
+            idempotency_key=f"{base_key}:monthly",
+            period_month=_current_period_month(),
+        )
     if topup_amt > 0:
         balance_after = _insert_ledger_event(
             user,
@@ -3915,98 +2862,10 @@ def _refund_credits(user, ref_doctype, ref_name, reason=None):
             reason=reason or "Refund on job failure",
             ref_doctype=ref_doctype,
             ref_name=ref_name,
-            idempotency_key=topup_key,
-            legacy_keys=[f"{legacy_base}:topup"],
+            idempotency_key=f"{base_key}:topup",
         )
 
     return {"applied": monthly_amt + topup_amt, "balance_after": balance_after}
-
-
-def _job_debit_keys(user, job_idempotency_key):
-    """The two ledger keys `_ai_submit` produced for this job's debit."""
-    if not job_idempotency_key:
-        return None, None
-    return _debit_sub_keys(_idem("ai_submit", user, job_idempotency_key))
-
-
-def _refund_job_credits(user, job_name, job_idempotency_key=None, reason=None):
-    """Refund a job's debit, whether or not the `ref_name` backfill ever ran.
-
-    `_refund_credits` finds the debit rows by `(ref_doctype, ref_name)`, and
-    `ref_name` is written by an opportunistic UPDATE after the job insert whose
-    failure was swallowed with a comment claiming refunds would still work "by
-    job name". They would not — the rows the refund searches for are exactly
-    the rows that UPDATE was supposed to label, so a silent backfill failure
-    disabled refunds for that job permanently.
-
-    Recomputing the debit key from (user, the job's own idempotency key) makes
-    the refund independent of that write: if the labelled rows aren't there, we
-    find them by key, label them, and refund normally.
-    """
-    found = frappe.db.get_value(
-        "AI Credit Ledger",
-        {
-            "user": user,
-            "ref_doctype": "AI Job",
-            "ref_name": job_name,
-            "event_type": "debit_submit",
-        },
-        "name",
-    )
-    if not found and job_idempotency_key:
-        m_key, t_key = _job_debit_keys(user, job_idempotency_key)
-        if m_key:
-            frappe.db.sql(
-                """update `tabAI Credit Ledger`
-                   set ref_name = %(name)s
-                   where user = %(user)s
-                     and ref_doctype = 'AI Job'
-                     and (ref_name is null or ref_name = '')
-                     and idempotency_key in (%(m_key)s, %(t_key)s)""",
-                {"name": job_name, "user": user, "m_key": m_key, "t_key": t_key},
-            )
-    return _refund_credits(user, "AI Job", job_name, reason=reason)
-
-
-def _refund_partial_credits(user, ref_doctype, ref_name, delivered, paid_for, reason=None):
-    """Refund the share of a debit covering work that was never delivered.
-
-    A four-variation run that returns two images was charged for four. The
-    per-variation share of the original debit is returned to the topup bucket
-    (which never expires), keyed idempotently on the job so a worker retry
-    can't refund twice.
-    """
-    delivered = max(0, int(delivered))
-    paid_for = max(1, int(paid_for))
-    if delivered >= paid_for:
-        return 0
-    debits = frappe.get_all(
-        "AI Credit Ledger",
-        filters={
-            "user": user,
-            "ref_doctype": ref_doctype,
-            "ref_name": ref_name,
-            "event_type": "debit_submit",
-        },
-        fields=["delta"],
-    )
-    charged = -sum(int(r.delta) for r in debits if int(r.delta) < 0)
-    if charged <= 0:
-        return 0
-    give_back = int(round(charged * (paid_for - delivered) / float(paid_for)))
-    if give_back <= 0:
-        return 0
-    _insert_ledger_event(
-        user,
-        event_type="refund_failure",
-        bucket="topup",
-        delta=give_back,
-        reason=(reason or f"Partial delivery: {delivered}/{paid_for} variations")[:200],
-        ref_doctype=ref_doctype,
-        ref_name=ref_name,
-        idempotency_key=_idem("refund_partial", ref_doctype, ref_name),
-    )
-    return give_back
 
 
 def _reverse_debit(user, debit_key, debit_result):
@@ -4014,11 +2873,6 @@ def _reverse_debit(user, debit_key, debit_result):
     enqueue (so the ref_name backfill never ran and `_refund_credits`, which
     keys on ref, can't find it). Mirrors the per-bucket amounts back into the
     ledger. Idempotent on a derived reversal key.
-
-    The suffixes are two characters because `_idem` already spends 65 of the
-    `idempotency_key` column's 80: the old `:reversal:monthly` suffix pushed
-    the key past the limit, and an overflowing key does not deduplicate — it
-    inserts a fresh credit every time the path is hit.
     """
     if not debit_result:
         return
@@ -4033,8 +2887,8 @@ def _reverse_debit(user, debit_key, debit_result):
             reason="Reversed: submit crashed before enqueue",
             ref_doctype="AI Job",
             ref_name="",
-            idempotency_key=f"{debit_key}:rm",
-            period_month=_current_period_month(user),
+            idempotency_key=f"{debit_key}:reversal:monthly",
+            period_month=_current_period_month(),
         )
     if topup_taken > 0:
         _insert_ledger_event(
@@ -4045,7 +2899,7 @@ def _reverse_debit(user, debit_key, debit_result):
             reason="Reversed: submit crashed before enqueue",
             ref_doctype="AI Job",
             ref_name="",
-            idempotency_key=f"{debit_key}:rt",
+            idempotency_key=f"{debit_key}:reversal:topup",
         )
 
 
@@ -4092,16 +2946,9 @@ def _claim_daily_reward(flag_key, event_prefix, reason):
         )
     user = frappe.session.user
     from frappe.utils import nowdate
-    # Hashed: the plain `{prefix}:{user}:{date}` form is 77-80 chars for an
-    # anonymous account's email and overflows the 80-char column outright for a
-    # longer one. An overflowing key does not deduplicate, which would turn the
-    # once-a-day cap into once-per-tap.
-    legacy_key = f"{event_prefix}:{user}:{nowdate()}"
-    key = _idem(event_prefix, user, nowdate())
+    key = f"{event_prefix}:{user}:{nowdate()}"
     try:
-        if frappe.db.get_value(
-            "AI Credit Ledger", {"idempotency_key": ["in", [key, legacy_key]]}, "name"
-        ):
+        if frappe.db.get_value("AI Credit Ledger", {"idempotency_key": key}, "name"):
             state = _get_credit_state(user)
             return {
                 "granted": False,
@@ -4117,7 +2964,6 @@ def _claim_daily_reward(flag_key, event_prefix, reason):
                 delta=_REWARD_CREDIT_AMOUNT,
                 reason=reason,
                 idempotency_key=key,
-                legacy_keys=[legacy_key],
             )
         except (frappe.DuplicateEntryError, frappe.UniqueValidationError):
             # Two concurrent claims raced past the pre-check; the unique index
@@ -4168,7 +3014,7 @@ def dev_grant_credits(**kwargs):
     if "System Manager" not in frappe.get_roles(frappe.session.user):
         return _error_response("FORBIDDEN", "System Manager role required", 403)
 
-    data = _read_json_body()
+    data = _read_json_body() if not kwargs else kwargs
     if not isinstance(data, dict):
         return _error_response("INVALID_BODY", "Expected JSON object", 400)
 
@@ -4189,13 +3035,9 @@ def dev_grant_credits(**kwargs):
             bucket=bucket,
             delta=delta,
             reason=data.get("reason") or "Dev grant",
-            idempotency_key=(
-                _idem("devgrant", target, data.get("idempotency_key"))
-                if data.get("idempotency_key")
-                else None
-            ),
+            idempotency_key=data.get("idempotency_key"),
             period_month=data.get("period_month")
-                or (_current_period_month(target) if bucket == "monthly" else None),
+                or (_current_period_month() if bucket == "monthly" else None),
         )
         frappe.db.commit()
         return {"ok": True, "balance_after": balance_after}
@@ -4219,38 +3061,14 @@ def dev_grant_credits(**kwargs):
 _CREDIT_HD_MULTIPLIER = 2
 
 
-_CREDIT_GATING_CACHE_KEY = "credit_gating_last_known"
-
-
 def _credit_gating_enabled():
-    """Whether AI submissions are charged against the credit ledger.
-
-    This used to swallow every exception into False — i.e. a transient
-    database hiccup made every paid AI generation free, for as long as the
-    hiccup lasted, with nothing in the logs to say so. Now the last value we
-    successfully read is cached for a day and used as the fallback, and if we
-    have never read it at all the error propagates so the caller can return a
-    503 instead of quietly giving the product away.
+    """Cheap wrapper around the feature flag. Anything other than an enabled
+    `credit_gating` flag returns False so legacy behaviour holds.
     """
     try:
-        value = bool(_flag_enabled("credit_gating"))
+        return _flag_enabled("credit_gating")
     except Exception:
-        frappe.log_error(frappe.get_traceback(), "v1.credit_gating_flag")
-        cached = None
-        try:
-            cached = frappe.cache().get_value(_CREDIT_GATING_CACHE_KEY)
-        except Exception:
-            cached = None
-        if cached is None:
-            raise
-        return bool(cached)
-    try:
-        frappe.cache().set_value(
-            _CREDIT_GATING_CACHE_KEY, 1 if value else 0, expires_in_sec=60 * 60 * 24
-        )
-    except Exception:
-        pass
-    return value
+        return False
 
 
 def _credit_cost_for(tool_id, quality, variations):
@@ -4274,41 +3092,22 @@ def _credit_cost_for(tool_id, quality, variations):
 # login Website User row (so password auth can't hit it). Subsequent calls
 # use the returned token in the standard Authorization header.
 #
-# Idempotent: re-calling with the same `device_id` AND the same
-# `device_secret` returns the same row's keys. The row's email is namespaced
-# (`anon-<device_id>@buildcost.anon`) so it can never collide with a real user.
-#
-# `device_secret` is what makes this safe. `device_id` is a client-chosen
-# string the app publishes in several places — a URL query parameter to the
-# feature-flag endpoint (so it lands in every nginx access log), the body of
-# the unauthenticated client-error endpoint, and `obfuscatedAccountId` in
-# Google Play. It is an identifier, not a credential, and it was being
-# accepted as proof of identity: name any account's device_id and this handed
-# you its API secret. The secret is generated on the device, stored only
-# there, and only its SHA-256 ever reaches the server (see `Anon Device`).
+# Idempotent: re-calling with the same `device_id` returns the same row's
+# keys. The row's email is namespaced (`anon-<device_id>@buildcost.anon`) so
+# it can never collide with a real user.
 # ===========================================================================
 
 _ANON_EMAIL_DOMAIN = "buildcost.anon"
 
 
-def _sha256_hex(value):
-    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
-
-
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def anon_bootstrap(**kwargs):
-    """Create / return the anonymous account owned by this device.
+    """Create / return the anonymous account keyed to this device.
 
-    Body: {"device_id": "<uuid>", "device_secret": "<32+ random chars>"}
+    Body: {"device_id": "<uuid>"}
     Returns: {"anon_user_id", "api_key", "api_secret", "created"}
-
-    The device generates `device_secret` once, keeps it, and presents it on
-    every bootstrap. Only its hash is stored. A caller who knows a
-    `device_id` but not its secret gets a 403 and learns nothing — the
-    correct response is to generate a fresh device identity, which yields a
-    fresh empty account rather than someone else's.
     """
-    data = _read_json_body()
+    data = _read_json_body() if not kwargs else kwargs
     if not isinstance(data, dict):
         return _error_response("INVALID_BODY", "Expected JSON object", 400)
 
@@ -4328,79 +3127,9 @@ def anon_bootstrap(**kwargs):
             400,
         )
 
-    device_secret = (data.get("device_secret") or "").strip()
-    if len(device_secret) < 32 or len(device_secret) > 256:
-        return _error_response(
-            "INVALID_PARAMS",
-            "device_secret must be a 32-256 char client-generated random string",
-            400,
-        )
-
-    device_hash = _sha256_hex(device_id)
-    secret_hash = _sha256_hex(device_secret)
     email = f"anon-{device_id}@{_ANON_EMAIL_DOMAIN}"
-    client_ip = _client_ip()
-
     try:
-        binding = frappe.db.get_value(
-            "Anon Device",
-            device_hash,
-            ["name", "user", "secret_hash", "bootstrap_count"],
-            as_dict=True,
-        )
-        if binding:
-            # Constant-time compare so the endpoint can't be used as an oracle.
-            import hmac
-
-            if not hmac.compare_digest(binding.secret_hash or "", secret_hash):
-                frappe.log_error(
-                    f"anon_bootstrap: secret mismatch for device {device_hash[:16]}"
-                    f" from {client_ip}",
-                    "v1.anon_bootstrap.denied",
-                )
-                return _error_response(
-                    "DEVICE_CLAIMED",
-                    "This device identity is already registered. Generate a new one.",
-                    403,
-                )
-            api_key, api_secret = _user_keys(binding.user)
-            frappe.db.set_value(
-                "Anon Device",
-                binding.name,
-                {
-                    "last_seen_at": frappe.utils.now_datetime(),
-                    "bootstrap_count": int(binding.bootstrap_count or 0) + 1,
-                },
-                update_modified=False,
-            )
-            frappe.db.commit()
-            return {
-                "anon_user_id": binding.user,
-                "api_key": api_key,
-                "api_secret": api_secret,
-                "created": False,
-            }
-
-        # No binding. Any pre-existing User row for this email predates the
-        # secret (or is someone else's); either way we will not hand out its
-        # keys on the strength of a device id alone.
-        if frappe.db.get_value("User", {"email": email}, "name"):
-            return _error_response(
-                "DEVICE_CLAIMED",
-                "This device identity is already registered. Generate a new one.",
-                403,
-            )
-
-        # F-30: creation is unauthenticated by design, so the only thing
-        # bounding it is this per-IP daily budget.
-        if not _ip_daily_allowed("anon_bootstrap_ip", _BOOTSTRAP_IP_DAILY_CAP, ip=client_ip):
-            return _error_response(
-                "RATE_LIMITED",
-                "Too many new devices from this network today. Try again later.",
-                429,
-            )
-
-        user_name = None
+        user_name = frappe.db.get_value("User", {"email": email}, "name")
         created = False
 
         if not user_name:
@@ -4420,18 +3149,6 @@ def anon_bootstrap(**kwargs):
             user_name = u.name
             created = True
 
-        # Bind the account to this device BEFORE issuing keys, so a crash
-        # between the two can never leave an unclaimable account behind that
-        # the next caller could take over.
-        binding_doc = frappe.new_doc("Anon Device")
-        binding_doc.device_hash = device_hash
-        binding_doc.user = user_name
-        binding_doc.secret_hash = secret_hash
-        binding_doc.created_ip = (client_ip or "")[:45]
-        binding_doc.last_seen_at = frappe.utils.now_datetime()
-        binding_doc.bootstrap_count = 1
-        binding_doc.insert(ignore_permissions=True)
-
         # _user_keys returns a (api_key, api_secret) tuple.
         api_key, api_secret = _user_keys(user_name)
 
@@ -4440,9 +3157,12 @@ def anon_bootstrap(**kwargs):
         # creation of this device row, and only within the per-IP daily cap, to
         # slow credit farming via rotating device_ids. A failed/denied grant
         # never blocks the auth handshake.
-        if created and _welcome_ip_allowed(ip=client_ip):
+        if created and _welcome_ip_allowed():
             try:
-                _grant_welcome_credits(user_name, device_id=device_id)
+                _grant_welcome_credits(
+                    user_name,
+                    idempotency_key=f"welcome:{device_id}",
+                )
             except Exception:
                 frappe.log_error(frappe.get_traceback(), "anon_bootstrap.welcome_grant")
 
@@ -4486,27 +3206,9 @@ _TOPUP_GRANT_TABLE = {
 
 
 def _topup_dedup_key(product_id, receipt_token, purchase_id):
-    """Stable per-purchase key so re-submits don't double-grant.
-
-    Deliberately GLOBAL, not per-user: the same receipt must not be grantable
-    twice no matter who presents it. `_claim_topup_receipt` below turns that
-    into an ownership check, because a global key on its own silently returned
-    "already granted" to a second user replaying someone else's receipt —
-    a false success where the honest answer is "that isn't yours".
-    """
+    """Stable per-purchase key so re-submits don't double-grant."""
     src = f"{product_id}|{purchase_id or ''}|{receipt_token or ''}"
     return "topup:" + hashlib.sha256(src.encode("utf-8")).hexdigest()[:48]
-
-
-def _claim_topup_receipt(user, dedup_key):
-    """Who, if anyone, has already redeemed this receipt.
-
-    Returns (owner_user or None). Callers reject a mismatch rather than
-    reporting a grant that never happened.
-    """
-    return frappe.db.get_value(
-        "AI Credit Ledger", {"idempotency_key": dedup_key}, "user"
-    )
 
 
 @frappe.whitelist(methods=["POST"])
@@ -4523,8 +3225,7 @@ def grant_topup_credits(**kwargs):
     except frappe.AuthenticationError:
         return _error_response("UNAUTHORIZED", "Authentication required", 401)
 
-    # Body only — see `_read_json_body`. A receipt is not a query parameter.
-    data = _read_json_body()
+    data = _read_json_body() if not kwargs else kwargs
     if not isinstance(data, dict):
         return _error_response("INVALID_BODY", "Expected JSON object", 400)
 
@@ -4580,39 +3281,23 @@ def grant_topup_credits(**kwargs):
 
     grant_amount = _TOPUP_GRANT_TABLE[product_id]
     dedup_key = _topup_dedup_key(product_id, receipt_token, purchase_id)
-    user = frappe.session.user
-
-    owner = _claim_topup_receipt(user, dedup_key)
-    if owner and owner != user:
-        frappe.log_error(
-            f"grant_topup_credits: receipt owned by {owner}, replayed by {user}",
-            "v1.grant_topup_credits.foreign_receipt",
-        )
-        return _error_response(
-            "RECEIPT_FOREIGN",
-            "This purchase belongs to a different account.",
-            403,
-        )
 
     try:
-        with _user_ledger_lock(user):
-            balance_after = _grant_topup_credits(
-                user,
-                amount=grant_amount,
-                idempotency_key=dedup_key,
-                reason=f"Top-up: {product_id}",
-                ref_name=purchase_id or product_id,
-            )
+        balance_after = _grant_topup_credits(
+            frappe.session.user,
+            amount=grant_amount,
+            idempotency_key=dedup_key,
+            reason=f"Top-up: {product_id}",
+            ref_name=purchase_id or product_id,
+        )
         frappe.db.commit()
-        state = _get_credit_state(user)
+        state = _get_credit_state(frappe.session.user)
         return {
             "ok": True,
             "granted": grant_amount,
             "balance_after": balance_after,
             "balance": state,
         }
-    except LedgerLockError:
-        return _error_response("BUSY", "Please try again in a moment.", 409)
     except Exception:
         corr = _log_unhandled("v1.grant_topup_credits")
         return _error_response(

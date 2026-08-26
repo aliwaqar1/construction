@@ -1,179 +1,187 @@
 {
-  "actions": [],
-  "allow_rename": 0,
-  "autoname": "format:AIJ-{YY}{MM}-{#####}",
-  "creation": "2026-05-05 00:00:00.000000",
-  "doctype": "DocType",
-  "engine": "InnoDB",
-  "field_order": [
-    "job_type",
-    "status",
-    "user",
-    "idempotency_key",
-    "request_hash",
-    "request_payload_json",
-    "result_json",
-    "error_code",
-    "error_message",
-    "model",
-    "tokens_input",
-    "tokens_output",
-    "cost_cents",
-    "started_at",
-    "completed_at",
-    "quality",
-    "variation_count",
-    "source_image_url",
-    "mask_url",
-    "ref_image_url"
-  ],
-  "fields": [
-    {
-      "fieldname": "job_type",
-      "fieldtype": "Select",
-      "options": "floor_plan\ninterior\nexterior\ngarden\nlayout\ncleanup\nref\npaint\nreplace\nfloor",
-      "in_list_view": 1,
-      "in_standard_filter": 1,
-      "label": "Job Type",
-      "reqd": 1
-    },
-    {
-      "fieldname": "status",
-      "fieldtype": "Select",
-      "options": "queued\nrunning\nsucceeded\nfailed",
-      "default": "queued",
-      "in_list_view": 1,
-      "in_standard_filter": 1,
-      "label": "Status",
-      "reqd": 1
-    },
-    {
-      "fieldname": "user",
-      "fieldtype": "Link",
-      "options": "User",
-      "in_list_view": 1,
-      "in_standard_filter": 1,
-      "label": "User",
-      "reqd": 1
-    },
-    {
-      "fieldname": "idempotency_key",
-      "fieldtype": "Data",
-      "label": "Idempotency Key",
-      "description": "Client-supplied; (user, key) pair must be unique"
-    },
-    {
-      "fieldname": "request_hash",
-      "fieldtype": "Data",
-      "label": "Request Hash",
-      "description": "sha256 of canonical request payload \u2014 for dedup"
-    },
-    {
-      "fieldname": "request_payload_json",
-      "fieldtype": "Long Text",
-      "label": "Request Payload JSON"
-    },
-    {
-      "fieldname": "result_json",
-      "fieldtype": "Long Text",
-      "label": "Result JSON"
-    },
-    {
-      "fieldname": "error_code",
-      "fieldtype": "Data",
-      "label": "Error Code"
-    },
-    {
-      "fieldname": "error_message",
-      "fieldtype": "Small Text",
-      "label": "Error Message"
-    },
-    {
-      "fieldname": "model",
-      "fieldtype": "Data",
-      "label": "Model"
-    },
-    {
-      "fieldname": "tokens_input",
-      "fieldtype": "Int",
-      "label": "Tokens In"
-    },
-    {
-      "fieldname": "tokens_output",
-      "fieldtype": "Int",
-      "label": "Tokens Out"
-    },
-    {
-      "fieldname": "cost_cents",
-      "fieldtype": "Int",
-      "in_list_view": 1,
-      "label": "Cost (\u00a2)",
-      "description": "Cost in USD cents \u2014 billing & monitoring"
-    },
-    {
-      "fieldname": "started_at",
-      "fieldtype": "Datetime",
-      "label": "Started At"
-    },
-    {
-      "fieldname": "completed_at",
-      "fieldtype": "Datetime",
-      "label": "Completed At"
-    },
-    {
-      "fieldname": "quality",
-      "fieldtype": "Select",
-      "options": "std\nhd",
-      "default": "std",
-      "label": "Quality"
-    },
-    {
-      "fieldname": "variation_count",
-      "fieldtype": "Int",
-      "default": "1",
-      "label": "Variation count"
-    },
-    {
-      "fieldname": "source_image_url",
-      "fieldtype": "Data",
-      "label": "Source image URL"
-    },
-    {
-      "fieldname": "mask_url",
-      "fieldtype": "Data",
-      "label": "Mask image URL"
-    },
-    {
-      "fieldname": "ref_image_url",
-      "fieldtype": "Data",
-      "label": "Reference image URL"
-    }
-  ],
-  "index_web_pages_for_search": 0,
-  "links": [],
-  "modified": "2026-05-05 00:00:00.000000",
-  "modified_by": "Administrator",
-  "module": "construction",
-  "name": "AI Job",
-  "owner": "Administrator",
-  "permissions": [
-    {
-      "create": 1,
-      "delete": 1,
-      "export": 1,
-      "read": 1,
-      "report": 1,
-      "role": "System Manager",
-      "share": 0,
-      "write": 1
-    },
-    {
-      "if_owner": 1,
-      "read": 1,
-      "role": "Website User"
-    }
-  ],
-  "sort_field": "modified",
-  "sort_order": "DESC",
-  "track_changes": 0
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-05-05 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "job_type",
+  "status",
+  "user",
+  "idempotency_key",
+  "request_hash",
+  "request_payload_json",
+  "result_json",
+  "error_code",
+  "error_message",
+  "model",
+  "tokens_input",
+  "tokens_output",
+  "cost_cents",
+  "started_at",
+  "completed_at",
+  "quality",
+  "variation_count",
+  "source_image_url",
+  "mask_url",
+  "ref_image_url",
+  "charged_as_premium"
+ ],
+ "fields": [
+  {
+   "fieldname": "job_type",
+   "fieldtype": "Select",
+   "options": "floor_plan\ninterior\nexterior\ngarden\nlayout\ncleanup\nref\npaint\nreplace\nfloor",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Job Type",
+   "reqd": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "options": "queued\nrunning\nsucceeded\nfailed",
+   "default": "queued",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "reqd": 1
+  },
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "options": "User",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "User",
+   "reqd": 1
+  },
+  {
+   "fieldname": "idempotency_key",
+   "fieldtype": "Data",
+   "label": "Idempotency Key",
+   "description": "Client-supplied; (user, key) pair must be unique"
+  },
+  {
+   "fieldname": "request_hash",
+   "fieldtype": "Data",
+   "label": "Request Hash",
+   "description": "sha256 of canonical request payload \u2014 for dedup"
+  },
+  {
+   "fieldname": "request_payload_json",
+   "fieldtype": "Long Text",
+   "label": "Request Payload JSON"
+  },
+  {
+   "fieldname": "result_json",
+   "fieldtype": "Long Text",
+   "label": "Result JSON"
+  },
+  {
+   "fieldname": "error_code",
+   "fieldtype": "Data",
+   "label": "Error Code"
+  },
+  {
+   "fieldname": "error_message",
+   "fieldtype": "Small Text",
+   "label": "Error Message"
+  },
+  {
+   "fieldname": "model",
+   "fieldtype": "Data",
+   "label": "Model"
+  },
+  {
+   "fieldname": "tokens_input",
+   "fieldtype": "Int",
+   "label": "Tokens In"
+  },
+  {
+   "fieldname": "tokens_output",
+   "fieldtype": "Int",
+   "label": "Tokens Out"
+  },
+  {
+   "fieldname": "cost_cents",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Cost (\u00a2)",
+   "description": "Cost in USD cents \u2014 billing & monitoring"
+  },
+  {
+   "fieldname": "started_at",
+   "fieldtype": "Datetime",
+   "label": "Started At"
+  },
+  {
+   "fieldname": "completed_at",
+   "fieldtype": "Datetime",
+   "label": "Completed At"
+  },
+  {
+   "fieldname": "quality",
+   "fieldtype": "Select",
+   "options": "std\nhd",
+   "default": "std",
+   "label": "Quality"
+  },
+  {
+   "fieldname": "variation_count",
+   "fieldtype": "Int",
+   "default": "1",
+   "label": "Variation count"
+  },
+  {
+   "fieldname": "source_image_url",
+   "fieldtype": "Data",
+   "label": "Source image URL"
+  },
+  {
+   "fieldname": "mask_url",
+   "fieldtype": "Data",
+   "label": "Mask image URL"
+  },
+  {
+   "fieldname": "ref_image_url",
+   "fieldtype": "Data",
+   "label": "Reference image URL"
+  },
+  {
+   "fieldname": "charged_as_premium",
+   "fieldtype": "Check",
+   "default": "0",
+   "label": "Charged As Premium",
+   "description": "Entitlement resolved at SUBMIT, when the job was priced. The worker reads this instead of re-deriving premium minutes later \u2014 otherwise a subscription lapsing while the job sits in the queue watermarks an image the user paid Pro price for."
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-08-25 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "construction",
+ "name": "AI Job",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "export": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "if_owner": 1,
+   "read": 1,
+   "role": "Website User"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 0
 }

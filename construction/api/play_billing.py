@@ -6,10 +6,19 @@ Site config keys (site_config.json):
     play_billing_service_account_file  absolute path to the service-account
                                        JSON key, OR
     play_billing_service_account_json  the key inlined as a dict
-    play_billing_relaxed               OPTIONAL, default false. When true and
-                                       validation is NOT configured, callers
-                                       may fall back to trusting the client
-                                       (local QA only — never production).
+    play_billing_relaxed               OPTIONAL, default false. When true AND
+                                       validation is NOT configured AND the
+                                       site has developer_mode on, callers may
+                                       fall back to trusting the client.
+                                       Local QA only. The developer_mode
+                                       requirement is deliberate: this flag
+                                       makes every entitlement and every credit
+                                       pack grantable from a made-up string, so
+                                       one line in a production site_config
+                                       would turn receipt validation into
+                                       theatre. A production site has
+                                       developer_mode off, so the escape hatch
+                                       simply cannot open there.
 
 Fail-closed by design: when the service account isn't configured and
 `play_billing_relaxed` is off, `require_configured()` raises and the grant
@@ -20,6 +29,17 @@ Play Console / service-account setup is done.
 import frappe
 
 _SCOPE = "https://www.googleapis.com/auth/androidpublisher"
+
+# These are the only network calls in the codebase that gate money, and they
+# were the only ones with no timeout at all — a hung Play API socket would pin
+# a gunicorn worker until the OS gave up, while the user's purchase sat
+# unacknowledged.
+_PLAY_HTTP_TIMEOUT_SEC = 15
+
+# Process-wide, not request-wide. The client was memoized on `frappe.local`,
+# which is torn down after every request, so each call paid for a fresh
+# discovery-document build and a fresh OAuth token exchange.
+_SERVICE = None
 
 # Values of Purchases.products purchaseState.
 PRODUCT_STATE_PURCHASED = 0
@@ -63,9 +83,24 @@ def is_configured():
 
 
 def relaxed_mode():
-    """True only when validation is unconfigured AND the site explicitly
-    opted into the QA fallback."""
-    return not is_configured() and _conf()["relaxed"]
+    """True only when validation is unconfigured, the site explicitly opted
+    into the QA fallback, AND the site is a developer_mode site.
+
+    See the module docstring: without the developer_mode requirement this one
+    site_config key silently disables receipt validation everywhere, and
+    nothing in the app's behaviour would look different until the revenue
+    report did.
+    """
+    if not (not is_configured() and _conf()["relaxed"]):
+        return False
+    if not frappe.conf.get("developer_mode"):
+        frappe.log_error(
+            "play_billing_relaxed is set on a NON-developer_mode site and was "
+            "ignored. Configure play_billing_service_account_* instead.",
+            "play_billing.relaxed_refused",
+        )
+        return False
+    return True
 
 
 def require_configured():
@@ -79,9 +114,9 @@ def require_configured():
 
 def _service():
     """Build (and memoize per-process) the androidpublisher client."""
-    svc = getattr(frappe.local, "_play_billing_service", None)
-    if svc is not None:
-        return svc
+    global _SERVICE
+    if _SERVICE is not None:
+        return _SERVICE
 
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -96,7 +131,27 @@ def _service():
             creds = service_account.Credentials.from_service_account_file(
                 c["sa_file"], scopes=[_SCOPE]
             )
-        svc = build("androidpublisher", "v3", credentials=creds, cache_discovery=False)
+        try:
+            import google_auth_httplib2
+            import httplib2
+
+            authed_http = google_auth_httplib2.AuthorizedHttp(
+                creds, http=httplib2.Http(timeout=_PLAY_HTTP_TIMEOUT_SEC)
+            )
+            svc = build(
+                "androidpublisher", "v3", http=authed_http, cache_discovery=False
+            )
+        except ImportError:
+            # Older google-api-python-client without google_auth_httplib2.
+            # Untimed, but still better than refusing to validate at all.
+            frappe.log_error(
+                "google_auth_httplib2 unavailable — Play API calls will not be "
+                "bounded by a timeout.",
+                "play_billing.no_timeout",
+            )
+            svc = build(
+                "androidpublisher", "v3", credentials=creds, cache_discovery=False
+            )
     except Exception:
         frappe.log_error(frappe.get_traceback(), "play_billing.service_init")
         raise PlayBillingError(
@@ -104,7 +159,7 @@ def _service():
             "Purchase validation is misconfigured on the server.",
             503,
         )
-    frappe.local._play_billing_service = svc
+    _SERVICE = svc
     return svc
 
 

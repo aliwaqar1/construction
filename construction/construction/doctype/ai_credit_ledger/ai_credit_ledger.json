@@ -25,7 +25,8 @@
    "label": "User",
    "in_list_view": 1,
    "in_standard_filter": 1,
-   "reqd": 1
+   "reqd": 1,
+   "search_index": 1
   },
   {
    "fieldname": "event_type",
@@ -43,7 +44,8 @@
    "label": "Bucket",
    "reqd": 1,
    "options": "monthly\ntopup",
-   "description": "Which sub-balance was affected. Monthly resets each period; topup never expires."
+   "description": "Which sub-balance was affected. Monthly resets each period; topup never expires.",
+   "search_index": 1
   },
   {
    "fieldname": "delta",
@@ -77,7 +79,8 @@
    "fieldname": "ref_name",
    "fieldtype": "Data",
    "label": "Ref Name",
-   "length": 200
+   "length": 200,
+   "search_index": 1
   },
   {
    "fieldname": "idempotency_key",
@@ -90,15 +93,16 @@
   {
    "fieldname": "period_month",
    "fieldtype": "Data",
-   "label": "Period (YYYY-MM)",
-   "length": 7,
+   "label": "Period",
+   "length": 10,
    "in_standard_filter": 1,
-   "description": "For grant_monthly events \u2014 which billing month the grant applies to."
+   "description": "Which credit period this event belongs to. Calendar month (YYYY-MM) for free users; the subscription anniversary date (YYYY-MM-DD) for Pro, so a monthly grant lands once per PAID period rather than once per calendar month.",
+   "search_index": 1
   }
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-05-24 00:00:00.000000",
+ "modified": "2026-08-25 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "construction",
  "name": "AI Credit Ledger",

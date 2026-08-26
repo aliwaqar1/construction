@@ -3539,7 +3539,26 @@ def _sum_deltas(user, bucket, period_month=None):
     return sum(int(r.delta or 0) for r in rows)
 
 
-def _get_credit_state(user, monthly_quota=_DEFAULT_MONTHLY_QUOTA):
+# Monthly-bucket events that move the CEILING rather than spend against it:
+# the grant itself, a clawback when a subscription is voided, and manual ops
+# adjustments. Everything else in the bucket (`debit_submit`, `refund_failure`)
+# is spend. Splitting the two is what lets `monthly_quota` report the quota the
+# user actually holds this period instead of a constant.
+_MONTHLY_ENTITLEMENT_EVENTS = ("grant_monthly", "clawback_refund", "adjustment")
+
+
+def _monthly_period_rows(user, period_month):
+    """Raw (event_type, delta) rows for the user's monthly bucket in `period_month`.
+    One query feeds both the balance and the entitlement split."""
+    return frappe.get_all(
+        "AI Credit Ledger",
+        filters={"user": user, "bucket": "monthly", "period_month": period_month},
+        fields=["event_type", "delta"],
+        limit_page_length=0,
+    )
+
+
+def _get_credit_state(user, monthly_quota=None):
     """Computed credit state for `user`. Read-only; never mutates.
 
     Balances are deliberately NOT clamped at zero. Clamping hid overspend: a
@@ -3547,10 +3566,31 @@ def _get_credit_state(user, monthly_quota=_DEFAULT_MONTHLY_QUOTA):
     already consumed were silently written off and the next debit started from
     a wrong baseline. A negative balance here is real — the spend gate
     compares against it and ops can see it in the ledger.
+
+    `monthly_quota` is DERIVED from the period's entitlement events, not from
+    `_DEFAULT_MONTHLY_QUOTA`. Reporting the constant meant every user who had
+    never received a monthly grant — every free user, and every Pro user whose
+    renew job had not run yet — read back `monthly_used = 80 - 0 = 80`, so the
+    app drew a full bar captioned "80 of 80 monthly credits used" at people who
+    had spent nothing. A user with no grant this period now gets quota 0, which
+    the client already treats as "no monthly allotment" and hides. Pass
+    `monthly_quota` explicitly only to override for diagnostics.
     """
     period = _current_period_month(user)
-    monthly_balance = _sum_deltas(user, "monthly", period_month=period)
+    rows = _monthly_period_rows(user, period)
+    monthly_balance = sum(int(r.delta or 0) for r in rows)
     topup_balance = _sum_deltas(user, "topup")
+    if monthly_quota is None:
+        monthly_quota = max(
+            0,
+            sum(
+                int(r.delta or 0)
+                for r in rows
+                if r.event_type in _MONTHLY_ENTITLEMENT_EVENTS
+            ),
+        )
+    # quota - balance is exactly the sum of the period's spend events, so this
+    # stays honest for partial grants and clawbacks alike.
     monthly_used = max(0, monthly_quota - monthly_balance)
     return {
         "monthly_balance": monthly_balance,

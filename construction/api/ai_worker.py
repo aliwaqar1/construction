@@ -1,7 +1,7 @@
 # AI worker - runs as a Frappe RQ background job.
 #
 # Vendor dispatch is configured in AI Settings (per tool_id child row):
-#   floor_plan -> default: gemini (gemini-2.0-flash, vision JSON)
+#   floor_plan -> default: gemini (gemini-3.8-flash, vision JSON)
 #   interior/exterior/garden/layout/cleanup/ref/paint/replace/floor
 #              -> default: mock (returns a deterministic stock image).
 #                 Flip the row's vendor to "gemini" + model
@@ -464,7 +464,7 @@ def _sanitize_prompt_inputs(payload):
 # take the whole product down; the vendor's own safety filter still applies).
 # ---------------------------------------------------------------------------
 
-_MODERATION_MODEL = "gemini-2.0-flash"
+_MODERATION_MODEL = "gemini-3.8-flash"
 
 _MODERATION_PROMPT = (
     "You are a strict content gate for a home-design app. Classify the image. "
@@ -725,7 +725,7 @@ _FP_LEVEL_MAX_SCORE = {"High": 1.0, "Medium": 0.84, "Low": 0.49}
 def _run_floor_plan(doc, payload):
     cfg = ai_cfg.get_job_config("floor_plan")
     vendor = (cfg.get("vendor") or "gemini").lower()
-    model = cfg.get("model") or "gemini-2.0-flash"
+    model = cfg.get("model") or "gemini-3.8-flash"
 
     image_bytes, mime = _read_uploaded_file(payload.get("image_url"))
 

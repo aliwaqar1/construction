@@ -18,7 +18,7 @@ class AISettings(Document):
 _DEFAULT_TOOL_CONFIGS = {
     "floor_plan": {
         "vendor": "gemini",
-        "model": "gemini-2.0-flash",
+        "model": "gemini-3.8-flash",
         "max_cost_cents": 5,
         "daily_budget_cents": 200,
         "monthly_budget_cents": 5000,

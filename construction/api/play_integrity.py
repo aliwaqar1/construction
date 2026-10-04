@@ -136,14 +136,23 @@ def is_configured():
     return bool(c["package_name"] and (c["sa_file"] or c["sa_json"]))
 
 
-def expected_nonce(device_id):
+def expected_nonce(device_id, binding=None):
     """The nonce this device must have baked into its integrity token.
 
     Derived from the device id, so a token minted for one device id cannot be
     replayed to claim another. URL-safe base64 with no padding, which is what
     the Play Integrity client expects.
+
+    `binding` is a second value the token must vouch for alongside the device
+    id — the Android ID hash for reinstall recovery, or a purchase-token hash
+    for purchase recovery. Without it in the nonce, a genuine device's token
+    could be paired with somebody else's value. Must match
+    `PlayIntegrityService.nonceFor` on the client.
     """
-    digest = hashlib.sha256(("anon:" + (device_id or "")).encode("utf-8")).digest()
+    src = "anon:" + (device_id or "")
+    if binding:
+        src += ":" + binding
+    digest = hashlib.sha256(src.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
@@ -211,8 +220,9 @@ def _decode(integrity_token):
     return resp.get("tokenPayloadExternal") or {}
 
 
-def evaluate(integrity_token, device_id):
-    """Verify `integrity_token` for `device_id`.
+def evaluate(integrity_token, device_id, binding=None):
+    """Verify `integrity_token` for `device_id` (and `binding`, see
+    `expected_nonce`).
 
     Returns a dict:
         {"checked": bool,      # did we actually reach Google?
@@ -269,7 +279,7 @@ def evaluate(integrity_token, device_id):
     #    token could be replayed to bless an unlimited number of new ids —
     #    which would leave the farming vector exactly where it was.
     nonce = request_details.get("nonce") or ""
-    if nonce != expected_nonce(device_id):
+    if nonce != expected_nonce(device_id, binding):
         return {
             "checked": True,
             "passed": False,

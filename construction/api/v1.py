@@ -3742,6 +3742,12 @@ _CLIENT_ERROR_IP_DAILY_CAP = 500
 # a genuine device.
 _ADOPT_IP_DAILY_CAP = 5
 
+# Ceiling on Android-ID reinstall RECOVERIES from one IP per day (see
+# `anon_bootstrap`). Each one also needs a passing Play Integrity verdict, so
+# this only bounds how fast anyone can probe; a household reinstalling a few
+# phones stays well inside it.
+_RECOVER_IP_DAILY_CAP = 10
+
 
 def _ip_daily_allowed(prefix, cap, ip=None):
     """Atomically claim one slot of a per-IP daily budget.
@@ -4365,10 +4371,13 @@ def _sha256_hex(value):
     return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
 
-def _attest_device(integrity_token, device_id, binding_doc=None):
+def _attest_device(integrity_token, device_id, binding_doc=None, binding=None, result=None):
     """Evaluate the device's Play Integrity token and record the verdict.
 
-    Returns {"allow_grant": bool, "reason": str}.
+    Returns {"allow_grant": bool, "reason": str, "passed": bool}. `passed` is
+    the raw verdict regardless of mode — False whenever nothing was verified.
+    `result` is an `evaluate()` result the caller already has, so the same
+    token isn't decoded twice.
 
     Fails OPEN on every kind of *our* failure — unconfigured, Google
     unreachable, a bug in the decode path. An outage on Google's side must not
@@ -4382,16 +4391,17 @@ def _attest_device(integrity_token, device_id, binding_doc=None):
 
     mode = play_integrity.mode()
     if mode == play_integrity.MODE_OFF:
-        return {"allow_grant": True, "reason": "OFF"}
+        return {"allow_grant": True, "reason": "OFF", "passed": False}
 
-    try:
-        result = play_integrity.evaluate(integrity_token, device_id)
-    except play_integrity.PlayIntegrityError as e:
-        frappe.log_error(str(e), "anon_bootstrap.attestation_unavailable")
-        return {"allow_grant": True, "reason": "UNAVAILABLE"}
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "anon_bootstrap.attestation_error")
-        return {"allow_grant": True, "reason": "ERROR"}
+    if result is None:
+        try:
+            result = play_integrity.evaluate(integrity_token, device_id, binding)
+        except play_integrity.PlayIntegrityError as e:
+            frappe.log_error(str(e), "anon_bootstrap.attestation_unavailable")
+            return {"allow_grant": True, "reason": "UNAVAILABLE", "passed": False}
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "anon_bootstrap.attestation_error")
+            return {"allow_grant": True, "reason": "ERROR", "passed": False}
 
     # Record what we saw, whatever the mode. In `audit` this is the whole
     # point: it is how you find out what the real verdict distribution looks
@@ -4413,11 +4423,85 @@ def _attest_device(integrity_token, device_id, binding_doc=None):
                 frappe.get_traceback(), "anon_bootstrap.attestation_record"
             )
 
+    passed = bool(result["passed"])
     if mode == play_integrity.MODE_AUDIT:
-        return {"allow_grant": True, "reason": "AUDIT_%s" % result["reason"]}
+        return {"allow_grant": True, "reason": "AUDIT_%s" % result["reason"], "passed": passed}
 
     # enforce
-    return {"allow_grant": bool(result["passed"]), "reason": result["reason"]}
+    return {"allow_grant": passed, "reason": result["reason"], "passed": passed}
+
+
+def _verified_integrity(integrity_token, device_id, binding):
+    """`play_integrity.evaluate()` for the recovery paths, or None when the
+    verdict could not be obtained (unconfigured, Google unreachable, no token).
+
+    Unlike `_attest_device` this ignores `play_integrity_mode`: recovery hands
+    over an EXISTING account, so it needs a real passing verdict even in
+    off/audit, and fails closed on every error.
+    """
+    from construction.api import play_integrity
+
+    if not integrity_token:
+        return None
+    try:
+        return play_integrity.evaluate(integrity_token, device_id, binding)
+    except play_integrity.PlayIntegrityError as e:
+        frappe.log_error(str(e), "anon_recovery.attestation_unavailable")
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "anon_recovery.attestation_error")
+    return None
+
+
+def _valid_sha256_hex(value):
+    return len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _rebind_recovered_device(user, device_hash, secret_hash, android_id_hash, client_ip):
+    """Bind a fresh device id + secret to an existing account after a verified
+    Android-ID recovery, and return the bootstrap response for it.
+
+    The Android ID hash moves to the new row: the old row's device id and
+    secret died with the uninstall, and one hash must name one row so the
+    lookup stays unambiguous.
+    """
+    frappe.db.sql(
+        "update `tabAnon Device` set android_id_hash = NULL"
+        " where android_id_hash = %s",
+        (android_id_hash,),
+    )
+    row = frappe.new_doc("Anon Device")
+    row.device_hash = device_hash
+    row.user = user
+    row.secret_hash = secret_hash
+    row.android_id_hash = android_id_hash
+    row.created_ip = (client_ip or "")[:45]
+    row.last_seen_at = frappe.utils.now_datetime()
+    row.bootstrap_count = 1
+    try:
+        row.insert(ignore_permissions=True)
+    except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
+        frappe.db.rollback()
+        return _error_response(
+            "DEVICE_CLAIMED",
+            "This device identity is already registered. Generate a new one.",
+            403,
+        )
+    frappe.log_error(
+        f"anon_bootstrap: recovered {user} for device {device_hash[:16]}"
+        f" from {client_ip}",
+        "v1.anon_bootstrap.recovered",
+    )
+    api_key, api_secret = _user_keys(user)
+    frappe.db.commit()
+    # No welcome grant: the account already had its one.
+    return {
+        "anon_user_id": user,
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "created": False,
+        "recovered": True,
+        "recovery_bound": True,
+    }
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
@@ -4426,9 +4510,11 @@ def anon_bootstrap(**kwargs):
 
     Body: {"device_id": "<uuid>",
            "device_secret": "<32+ random chars>",
-           "integrity_token": "<Play Integrity token>"}   # optional
+           "integrity_token": "<Play Integrity token>",   # optional
+           "android_id_hash": "<sha256 hex>"}             # optional
     Returns: {"anon_user_id", "api_key", "api_secret", "created",
-              "welcome_granted", "attestation"}
+              "welcome_granted", "attestation", "recovered",
+              "recovery_bound"}
 
     The device generates `device_secret` once, keeps it, and presents it on
     every bootstrap. Only its hash is stored. A caller who knows a
@@ -4479,6 +4565,16 @@ def anon_bootstrap(**kwargs):
     # still get an account.
     integrity_token = (data.get("integrity_token") or "").strip()
 
+    # Optional. sha256 of the app-scoped Android ID, which survives reinstall
+    # — see "Reinstall recovery" below. When present, the client bakes it into
+    # the integrity nonce, so it must be passed to every evaluate() here.
+    android_id_hash = (data.get("android_id_hash") or "").strip().lower()
+    if android_id_hash and not _valid_sha256_hex(android_id_hash):
+        return _error_response(
+            "INVALID_PARAMS", "android_id_hash must be a sha256 hex digest", 400
+        )
+    android_id_hash = android_id_hash or None
+
     device_hash = _sha256_hex(device_id)
     secret_hash = _sha256_hex(device_secret)
     email = f"anon-{device_id}@{_ANON_EMAIL_DOMAIN}"
@@ -4488,7 +4584,7 @@ def anon_bootstrap(**kwargs):
         binding = frappe.db.get_value(
             "Anon Device",
             device_hash,
-            ["name", "user", "secret_hash", "bootstrap_count"],
+            ["name", "user", "secret_hash", "bootstrap_count", "android_id_hash"],
             as_dict=True,
         )
         if binding:
@@ -4522,6 +4618,9 @@ def anon_bootstrap(**kwargs):
                 "api_key": api_key,
                 "api_secret": api_secret,
                 "created": False,
+                "recovery_bound": bool(
+                    android_id_hash and binding.android_id_hash == android_id_hash
+                ),
             }
 
         # No binding row. A pre-existing User for this email is an account
@@ -4595,6 +4694,41 @@ def anon_bootstrap(**kwargs):
                 "created": False,
             }
 
+        # Reinstall recovery. A new device id + secret is what an uninstall
+        # leaves behind (unless Block Store carried the old pair over), but the
+        # app-scoped Android ID survives it. If this Android ID is on file and
+        # Google vouches — via a token whose nonce binds both the device id and
+        # this hash — that the request comes from our unmodified Play build on
+        # a genuine device, the caller is that phone's own app: hand back the
+        # account instead of minting an empty one.
+        #
+        # The hash is only readable by our app on that phone, and a script,
+        # repackaged build or rooted device cannot get a passing verdict, so
+        # knowing a hash is not enough. Fails closed: any doubt creates a new
+        # account, which is exactly what happened before this existed.
+        recovery_result = None
+        if android_id_hash:
+            recover_user = frappe.db.get_value(
+                "Anon Device", {"android_id_hash": android_id_hash}, "user"
+            )
+            if recover_user and _ip_daily_allowed(
+                "anon_recover_ip", _RECOVER_IP_DAILY_CAP, ip=client_ip
+            ):
+                recovery_result = _verified_integrity(
+                    integrity_token, device_id, android_id_hash
+                )
+                if recovery_result and recovery_result["passed"]:
+                    return _rebind_recovered_device(
+                        recover_user, device_hash, secret_hash,
+                        android_id_hash, client_ip,
+                    )
+                frappe.log_error(
+                    f"anon_bootstrap: recovery refused for {recover_user} from "
+                    f"{client_ip}: "
+                    f"{(recovery_result or {}).get('reason') or 'NO_VERDICT'}",
+                    "v1.anon_bootstrap.recovery_refused",
+                )
+
         # F-30: creation is unauthenticated by design, so the only thing
         # bounding it is this per-IP daily budget.
         if not _ip_daily_allowed("anon_bootstrap_ip", _BOOTSTRAP_IP_DAILY_CAP, ip=client_ip):
@@ -4644,7 +4778,23 @@ def anon_bootstrap(**kwargs):
         # creation of this device row, and only within the per-IP daily cap, to
         # slow credit farming via rotating device_ids. A failed/denied grant
         # never blocks the auth handshake.
-        attestation = _attest_device(integrity_token, device_id, binding_doc)
+        attestation = _attest_device(
+            integrity_token, device_id, binding_doc,
+            binding=android_id_hash, result=recovery_result,
+        )
+
+        # Record the Android ID for future recovery only on a passing verdict:
+        # the nonce binds the hash, so a recorded hash provably came from our
+        # app on that device and can't be planted by someone else.
+        recovery_bound = False
+        if android_id_hash and attestation["passed"] and not frappe.db.exists(
+            "Anon Device", {"android_id_hash": android_id_hash}
+        ):
+            frappe.db.set_value(
+                "Anon Device", binding_doc.name, "android_id_hash",
+                android_id_hash, update_modified=False,
+            )
+            recovery_bound = True
 
         welcome_granted = False
         if created and attestation["allow_grant"] and _welcome_ip_allowed(ip=client_ip):
@@ -4662,6 +4812,7 @@ def anon_bootstrap(**kwargs):
             "created": created,
             "welcome_granted": welcome_granted,
             "attestation": attestation["reason"],
+            "recovery_bound": recovery_bound,
         }
     except Exception:
         corr = _log_unhandled("v1.anon_bootstrap")
@@ -4670,6 +4821,227 @@ def anon_bootstrap(**kwargs):
             "Failed to bootstrap anon account",
             500,
             correlation_id=corr,
+        )
+
+
+def _caller_device_row(device_id):
+    """The caller's own `Anon Device` row for `device_id`, or None."""
+    device_id = (device_id or "").strip()
+    if not 8 <= len(device_id) <= 128:
+        return None
+    row = frappe.db.get_value(
+        "Anon Device",
+        _sha256_hex(device_id),
+        ["name", "user", "android_id_hash"],
+        as_dict=True,
+    )
+    if not row or row.user != frappe.session.user:
+        return None
+    return row
+
+
+@frappe.whitelist(methods=["POST"])
+def bind_device_recovery(**kwargs):
+    """Record this phone's Android ID hash on the caller's device row, so a
+    later reinstall can recover the account (see `anon_bootstrap`).
+
+    For installs that bootstrapped before recovery existed, or whose bootstrap
+    couldn't record it. The integrity nonce binds device id + hash.
+
+    Body: {"device_id", "android_id_hash", "integrity_token"}
+    Returns: {"bound": bool, "reason"?}. A 200 is final for this install;
+    503 INTEGRITY_UNAVAILABLE means try again later.
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+
+    data = _read_json_body()
+    if not isinstance(data, dict):
+        return _error_response("INVALID_BODY", "Expected JSON object", 400)
+    device_id = (data.get("device_id") or "").strip()
+    android_id_hash = (data.get("android_id_hash") or "").strip().lower()
+    if not _valid_sha256_hex(android_id_hash):
+        return _error_response(
+            "INVALID_PARAMS", "android_id_hash must be a sha256 hex digest", 400
+        )
+
+    try:
+        row = _caller_device_row(device_id)
+        if not row:
+            return _error_response(
+                "NOT_YOUR_DEVICE", "This device is not bound to your account.", 403
+            )
+        if row.android_id_hash == android_id_hash:
+            return {"bound": True}
+
+        # Held by a different account: bootstrap recovery should have returned
+        # that account but couldn't get a verdict at the time. Never move it
+        # here — that would strand the older account, the one with history.
+        holder = frappe.db.get_value(
+            "Anon Device", {"android_id_hash": android_id_hash}, "user"
+        )
+        if holder and holder != row.user:
+            return {"bound": False, "reason": "HELD_BY_OTHER_ACCOUNT"}
+
+        result = _verified_integrity(
+            (data.get("integrity_token") or "").strip(), device_id, android_id_hash
+        )
+        if result is None:
+            return _error_response(
+                "INTEGRITY_UNAVAILABLE",
+                "Device verification is unavailable. Try again later.",
+                503,
+            )
+        if not result["passed"]:
+            return {"bound": False, "reason": result["reason"]}
+
+        frappe.db.sql(
+            "update `tabAnon Device` set android_id_hash = NULL"
+            " where android_id_hash = %s",
+            (android_id_hash,),
+        )
+        frappe.db.set_value(
+            "Anon Device", row.name, "android_id_hash", android_id_hash,
+            update_modified=False,
+        )
+        frappe.db.commit()
+        return {"bound": True}
+    except Exception:
+        corr = _log_unhandled("v1.bind_device_recovery")
+        return _error_response(
+            "SERVER_ERROR", "Failed to bind device", 500, correlation_id=corr
+        )
+
+
+@frappe.whitelist(methods=["POST"])
+def recover_by_purchase(**kwargs):
+    """Move this device onto the account that owns a Play subscription.
+
+    A reinstall that neither Block Store nor Android-ID recovery covered (new
+    phone without backup, factory reset) lands on a fresh empty account, and
+    restoring the subscription then fails with RECEIPT_FOREIGN because the
+    receipt is bound to the old one — a paying user locked out of what they
+    paid for.
+
+    Play hands a purchase token only to the Google account that bought it, so
+    presenting one — confirmed with Google, from our genuine app on a genuine
+    device (the integrity nonce binds the device id and sha256 of the token,
+    so a leaked token can't be fed in by a script) — proves the caller is the
+    buyer. The caller's device row is re-pointed at the owning account and
+    that account's keys are returned.
+
+    Refuses to switch away from an account with purchases of its own: that
+    would strand what was bought on it.
+
+    Body: {"device_id", "receipt", "integrity_token"}
+    Returns: {"switched": false} or
+             {"switched": true, "anon_user_id", "api_key", "api_secret"}
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+    from construction.api import play_billing
+
+    data = _read_json_body()
+    if not isinstance(data, dict):
+        return _error_response("INVALID_BODY", "Expected JSON object", 400)
+    device_id = (data.get("device_id") or "").strip()
+    receipt = (data.get("receipt") or "").strip()
+    if not receipt:
+        return _error_response("MISSING_PARAMS", "receipt is required", 400)
+    user = frappe.session.user
+
+    try:
+        row = _caller_device_row(device_id)
+        if not row:
+            return _error_response(
+                "NOT_YOUR_DEVICE", "This device is not bound to your account.", 403
+            )
+
+        owners = {r.user for r in _premium_rows(purchase_token=receipt)} - {user}
+        if not owners:
+            return {"switched": False}
+        if len(owners) > 1:
+            frappe.log_error(
+                f"recover_by_purchase: token held by several accounts {owners}",
+                "v1.recover_by_purchase.ambiguous",
+            )
+            return _error_response(
+                "RECEIPT_FOREIGN", "This purchase belongs to a different account.", 403
+            )
+        owner = owners.pop()
+
+        if _premium_rows(user=user, limit=1) or frappe.db.exists(
+            "AI Credit Ledger",
+            {"user": user, "idempotency_key": ["like", "topup:%"]},
+        ):
+            frappe.log_error(
+                f"recover_by_purchase: {user} has its own purchases; not moving"
+                f" it to {owner}",
+                "v1.recover_by_purchase.has_purchases",
+            )
+            return _error_response(
+                "ACCOUNT_HAS_PURCHASES",
+                "This account has purchases of its own.",
+                409,
+            )
+
+        result = _verified_integrity(
+            (data.get("integrity_token") or "").strip(),
+            device_id,
+            _sha256_hex(receipt),
+        )
+        if result is None:
+            return _error_response(
+                "INTEGRITY_UNAVAILABLE",
+                "Device verification is unavailable. Try again later.",
+                503,
+            )
+        if not result["passed"]:
+            frappe.log_error(
+                f"recover_by_purchase: integrity {result['reason']} for {user}",
+                "v1.recover_by_purchase.integrity_failed",
+            )
+            return _error_response(
+                "INTEGRITY_FAILED", "This device could not be verified.", 403
+            )
+
+        try:
+            verified = play_billing.verify_subscription(receipt)
+        except play_billing.PlayBillingError as e:
+            return _error_response(e.code, e.message, e.http_status)
+        oid = (verified.get("obfuscated_account_id") or "").strip().lower()
+        if _valid_sha256_hex(oid) and oid != _account_binding_id(owner):
+            frappe.log_error(
+                f"recover_by_purchase: Play account id disagrees with owner {owner}",
+                "v1.recover_by_purchase.owner_mismatch",
+            )
+            return _error_response(
+                "RECEIPT_FOREIGN", "This purchase belongs to a different account.", 403
+            )
+
+        frappe.db.set_value(
+            "Anon Device", row.name, "user", owner, update_modified=False
+        )
+        frappe.log_error(
+            f"recover_by_purchase: device {row.name[:16]} moved {user} -> {owner}",
+            "v1.recover_by_purchase.switched",
+        )
+        api_key, api_secret = _user_keys(owner)
+        frappe.db.commit()
+        return {
+            "switched": True,
+            "anon_user_id": owner,
+            "api_key": api_key,
+            "api_secret": api_secret,
+        }
+    except Exception:
+        corr = _log_unhandled("v1.recover_by_purchase")
+        return _error_response(
+            "SERVER_ERROR", "Failed to recover account", 500, correlation_id=corr
         )
 
 

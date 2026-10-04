@@ -9,6 +9,7 @@
   "device_hash",
   "user",
   "secret_hash",
+  "android_id_hash",
   "created_ip",
   "last_seen_at",
   "bootstrap_count",
@@ -44,6 +45,14 @@
    "length": 64,
    "reqd": 1,
    "description": "sha256 of the client-held device_secret. Presenting the matching secret is what proves ownership of this account at re-bootstrap."
+  },
+  {
+   "fieldname": "android_id_hash",
+   "fieldtype": "Data",
+   "label": "Android ID Hash",
+   "length": 64,
+   "search_index": 1,
+   "description": "sha256 of the app-scoped Android ID, recorded only on a passing Play Integrity verdict. Lets a reinstall on the same phone recover this account. At most one row holds a given hash."
   },
   {
    "fieldname": "created_ip",
@@ -85,7 +94,7 @@
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-08-25 00:00:00.000000",
+ "modified": "2026-10-04 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "construction",
  "name": "Anon Device",

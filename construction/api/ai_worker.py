@@ -684,15 +684,42 @@ def _require_key(vendor):
 # ---------------------------------------------------------------------------
 
 _FLOOR_PLAN_PROMPT = (
-    "You are an architect analyzing a residential floor plan image. "
-    "Identify the total covered area in square feet, the overall plot dimensions "
-    "as a 'A x B ft' string, and the count of distinct rooms. "
+    "You are an architect reading a residential floor plan image. "
+    "Work in feet: convert any feet-inch labels (12'-6\"), metres, marla or "
+    "kanal you read. Take sizes only from written dimensions or a drawn "
+    "scale; never assume typical house sizes.\n"
+    "- plot_width_ft / plot_depth_ft: the plot (boundary) size, or 0 if the "
+    "plan does not show the plot boundary.\n"
+    "- floor_areas_sqft: covered (built-up) area of each above-ground floor "
+    "drawn, ground floor first.\n"
+    "- basement_area_sqft: covered area of a basement if one is drawn, else 0.\n"
+    "- rooms: every room on every floor, with its label as written on the "
+    "plan and its width/length in feet (0 if not labelled).\n"
+    "- dimensions_source: \"labeled\" if sizes come from written dimensions, "
+    "\"scaled\" if measured against a drawn scale, \"estimated\" otherwise.\n"
+    "- notes: one short English sentence on anything uncertain (illegible "
+    "labels, partial plan), else empty.\n"
     "Reply ONLY with this JSON: "
-    "{\"detected_area_sqft\": number, \"detected_dimensions\": string, "
-    "\"detected_rooms\": integer, \"confidence\": number_between_0_and_1, "
+    "{\"plot_width_ft\": number, \"plot_depth_ft\": number, "
+    "\"floor_areas_sqft\": [number], \"basement_area_sqft\": number, "
+    "\"rooms\": [{\"label\": string, \"width_ft\": number, "
+    "\"length_ft\": number}], "
+    "\"dimensions_source\": one of [\"labeled\",\"scaled\",\"estimated\"], "
+    "\"confidence\": number_between_0_and_1, "
     "\"confidence_level\": one of [\"High\",\"Medium\",\"Low\"], "
     "\"notes\": string}"
 )
+
+# Bounds on model output — anything outside is treated as "not detected".
+_FP_MAX_SIDE_FT = 2000
+_FP_MAX_AREA_SQFT = 200_000
+_FP_MAX_ROOM_SIDE_FT = 200
+_FP_MAX_FLOORS = 30  # = PricingConfig.maxFloors in the app
+_FP_MAX_ROOMS = 60
+_FP_LEVELS = ("Low", "Medium", "High")
+# The model's own confidence can't exceed what its source of sizes supports.
+_FP_SOURCE_CAP = {"labeled": "High", "scaled": "Medium", "estimated": "Low"}
+_FP_LEVEL_MAX_SCORE = {"High": 1.0, "Medium": 0.84, "Low": 0.49}
 
 
 def _run_floor_plan(doc, payload):
@@ -793,15 +820,73 @@ def _parse_floor_plan_response(text):
                 detail="Floor-plan response was not JSON.",
             )
         ai = json.loads(text[start : end + 1])
+    if not isinstance(ai, dict):
+        raise _VendorError(
+            "VENDOR_RESPONSE", _VENDOR_USER_MESSAGES["VENDOR_RESPONSE"],
+            detail="Floor-plan response was not a JSON object.",
+        )
+
+    def num(value, upper):
+        try:
+            v = round(float(value), 1)
+        except (TypeError, ValueError):
+            return 0
+        return v if 0 < v <= upper else 0
+
+    width = num(ai.get("plot_width_ft"), _FP_MAX_SIDE_FT)
+    depth = num(ai.get("plot_depth_ft"), _FP_MAX_SIDE_FT)
+    if not (width and depth):
+        width = depth = 0
+
+    raw_floors = ai.get("floor_areas_sqft")
+    floors = [
+        a for a in (
+            num(v, _FP_MAX_AREA_SQFT)
+            for v in (raw_floors if isinstance(raw_floors, list) else [])
+        ) if a
+    ][:_FP_MAX_FLOORS]
+    basement = num(ai.get("basement_area_sqft"), _FP_MAX_AREA_SQFT)
+
+    raw_rooms = ai.get("rooms")
+    rooms = []
+    for r in (raw_rooms if isinstance(raw_rooms, list) else [])[:_FP_MAX_ROOMS]:
+        if not isinstance(r, dict):
+            continue
+        rooms.append({
+            "label": str(r.get("label") or "").strip()[:40],
+            "width_ft": num(r.get("width_ft"), _FP_MAX_ROOM_SIDE_FT),
+            "length_ft": num(r.get("length_ft"), _FP_MAX_ROOM_SIDE_FT),
+        })
+
+    source = ai.get("dimensions_source")
+    if source not in _FP_SOURCE_CAP:
+        source = "estimated"
+    level = str(ai.get("confidence_level") or "").capitalize()
+    if level not in _FP_LEVELS:
+        level = "Low"
+    level = min(level, _FP_SOURCE_CAP[source], key=_FP_LEVELS.index)
+    try:
+        score = max(0.0, min(float(ai.get("confidence") or 0), 1.0))
+    except (TypeError, ValueError):
+        score = 0.0
+    score = min(score, _FP_LEVEL_MAX_SCORE[level])
 
     return {
         "ai_result": {
-            "detected_area_sqft": ai.get("detected_area_sqft", 0),
-            "detected_dimensions": ai.get("detected_dimensions", ""),
-            "detected_rooms": ai.get("detected_rooms", 0),
-            "confidence": ai.get("confidence", 0),
-            "confidence_level": ai.get("confidence_level", "Low"),
-            "notes": ai.get("notes", ""),
+            "plot_width_ft": width,
+            "plot_depth_ft": depth,
+            "floor_areas_sqft": floors,
+            "basement_area_sqft": basement,
+            "rooms": rooms,
+            "dimensions_source": source,
+            # Legacy fields, still read by app builds before the per-floor
+            # breakdown.
+            "detected_area_sqft": round(sum(floors) + basement, 1),
+            "detected_dimensions": f"{width:g} x {depth:g} ft" if width else "",
+            "detected_rooms": len(rooms),
+            "confidence": score,
+            "confidence_level": level,
+            "notes": str(ai.get("notes") or "").strip()[:200],
         },
         "estimate": None,
     }
@@ -810,9 +895,19 @@ def _parse_floor_plan_response(text):
 def _mock_floor_plan_response():
     return {
         "ai_result": {
-            "detected_area_sqft": 1450,
+            "plot_width_ft": 50,
+            "plot_depth_ft": 29,
+            "floor_areas_sqft": [1015, 870],
+            "basement_area_sqft": 0,
+            "rooms": [
+                {"label": "Bed Room", "width_ft": 12, "length_ft": 14},
+                {"label": "Bath", "width_ft": 6, "length_ft": 8},
+                {"label": "Kitchen", "width_ft": 10, "length_ft": 12},
+            ],
+            "dimensions_source": "labeled",
+            "detected_area_sqft": 1885,
             "detected_dimensions": "50 x 29 ft",
-            "detected_rooms": 7,
+            "detected_rooms": 3,
             "confidence": 0.86,
             "confidence_level": "High",
             "notes": "Mock response - no real analysis performed.",

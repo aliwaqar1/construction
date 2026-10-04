@@ -4826,3 +4826,59 @@ def grant_topup_credits(**kwargs):
             correlation_id=corr,
         )
 
+
+
+# Debug builds of the app show a "+N credits" button next to Top up. The
+# client-side kDebugMode gate protects nothing — anyone can POST here — so the
+# server gate is an explicit per-user allowlist in site_config:
+#
+#     "debug_credit_users": ["<user id>"]
+#
+# Empty/absent (the default) refuses everyone. The refusal names the caller's
+# user id so the tester can copy it into the allowlist.
+_DEBUG_CREDIT_GRANT = 50
+
+
+@frappe.whitelist(methods=["POST"])
+def debug_grant_credits():
+    """Grant `_DEBUG_CREDIT_GRANT` top-up credits to an allowlisted user.
+
+    Returns: {"ok", "granted", "balance_after", "balance"}
+    """
+    try:
+        _require_auth()
+    except frappe.AuthenticationError:
+        return _error_response("UNAUTHORIZED", "Authentication required", 401)
+
+    user = frappe.session.user
+    allowed = frappe.get_site_config().get("debug_credit_users") or []
+    if not isinstance(allowed, list) or user not in allowed:
+        return _error_response(
+            "DEBUG_GRANT_NOT_ALLOWED",
+            f"Add {user} to debug_credit_users in site_config to enable debug credits.",
+            403,
+        )
+
+    try:
+        with _user_ledger_lock(user):
+            balance_after = _insert_ledger_event(
+                user,
+                event_type="adjustment",
+                bucket="topup",
+                delta=_DEBUG_CREDIT_GRANT,
+                reason="Debug grant (debug_credit_users)",
+            )
+        frappe.db.commit()
+        return {
+            "ok": True,
+            "granted": _DEBUG_CREDIT_GRANT,
+            "balance_after": balance_after,
+            "balance": _get_credit_state(user),
+        }
+    except LedgerLockError:
+        return _error_response("BUSY", "Please try again in a moment.", 409)
+    except Exception:
+        corr = _log_unhandled("v1.debug_grant_credits")
+        return _error_response(
+            "SERVER_ERROR", "Failed to grant debug credits", 500, correlation_id=corr
+        )
